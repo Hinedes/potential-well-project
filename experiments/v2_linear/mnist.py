@@ -39,7 +39,7 @@ from copy import deepcopy
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-H_TOTAL     = 512      # total hidden dim (shared between baseline and PWP)
+H_TOTAL     = 640      # total hidden dim (shared between baseline and PWP)
 N_TASKS     = 5        # number of permutation tasks
 N_CLASSES   = 10
 INPUT_DIM   = 784
