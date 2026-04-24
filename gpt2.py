@@ -102,8 +102,6 @@ class PWPMLPBlock(nn.Module):
                 activation="gelu",
                 params_dtype=torch.bfloat16,
             )
-            # TE hides parameters after the first forward pass, so we cache standard params references here.
-            self._te_trainable_params = [p for n, p in self.mlp.named_parameters() if "layer_norm" not in n]
         else:
             self.ln   = nn.LayerNorm(hidden)
             self.fc1  = nn.Linear(hidden, ffn_dim)
@@ -136,17 +134,24 @@ class PWPMLPBlock(nn.Module):
         Pi_out = self.get_P_out(d) @ self.get_P_out(d).T
 
         if HAS_TE:
-            # te.LayerNormMLP parameter names: fc1_weight (ffn x hidden),
-            # fc2_weight (hidden x ffn)
             for name, param in self.mlp.named_parameters():
                 if "fc1_weight" in name:
-                    def fc1_hook(g, Pi=Pi_in):
-                        return g @ Pi   # project input dimension (cols)
+                    def fc1_hook(g, Pi=Pi_in): return g @ Pi
                     self._hooks.append(param.register_hook(fc1_hook))
                 elif "fc2_weight" in name:
-                    def fc2_hook(g, Pi=Pi_out):
-                        return Pi @ g   # project output dimension (rows)
+                    def fc2_hook(g, Pi=Pi_out): return Pi @ g
                     self._hooks.append(param.register_hook(fc2_hook))
+            # Just in case named_parameters() is obscured, fallback to robust attribute checking
+            if not self._hooks:
+                for name in ["fc1_weight", "fc2_weight"]:
+                    if hasattr(self.mlp, name):
+                        param = getattr(self.mlp, name)
+                        if "fc1" in name:
+                            def fc1_hook(g, Pi=Pi_in): return g @ Pi
+                            self._hooks.append(param.register_hook(fc1_hook))
+                        elif "fc2" in name:
+                            def fc2_hook(g, Pi=Pi_out): return Pi @ g
+                            self._hooks.append(param.register_hook(fc2_hook))
         else:
             self._hooks.append(
                 self.fc1.weight.register_hook(lambda g, Pi=Pi_in: g @ Pi))
@@ -282,10 +287,13 @@ def train_domain1(model, tokenizer, text):
     for block in model.transformer.h:
         if isinstance(block.mlp, PWPMLPBlock):
             if HAS_TE:
-                params += block.mlp._te_trainable_params
+                # TE can hide or rename parameters after forward passes. Access exact weights natively:
+                for attr in ["fc1_weight", "fc1_bias", "fc2_weight", "fc2_bias"]:
+                    if hasattr(block.mlp.mlp, attr):
+                        params.append(getattr(block.mlp.mlp, attr))
             else:
                 params += [p for n, p in block.mlp.named_parameters()
-                           if "layer_norm" not in n]   # don't train LN for domain 1
+                           if "fc" in n]   # collect all fc ones (excludes LN and P buffers)
 
     opt    = torch.optim.AdamW(params, lr=LR)
     scaler = torch.amp.GradScaler()
