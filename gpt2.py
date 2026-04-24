@@ -196,31 +196,23 @@ def patch_gpt2(model):
             if HAS_TE:
                 sd = {n: p for n, p in pwp.mlp.named_parameters()}
                 if "layer_norm_weight" in sd:
-                    sd["layer_norm_weight"].copy_(
-                        block.ln_2.weight.to(torch.bfloat16))
-                    sd["layer_norm_bias"].copy_(
-                        block.ln_2.bias.to(torch.bfloat16))
+                    sd["layer_norm_weight"].copy_(block.ln_2.weight.to(torch.bfloat16))
+                    sd["layer_norm_bias"].copy_(block.ln_2.bias.to(torch.bfloat16))
                 if "fc1_weight" in sd:
-                    sd["fc1_weight"].copy_(
-                        block.mlp.c_fc.weight.t().to(torch.bfloat16))
+                    sd["fc1_weight"].copy_(block.mlp.c_fc.weight.t().to(torch.bfloat16))
                 if "fc1_bias" in sd:
-                    sd["fc1_bias"].copy_(
-                        block.mlp.c_fc.bias.to(torch.bfloat16))
+                    sd["fc1_bias"].copy_(block.mlp.c_fc.bias.to(torch.bfloat16))
                 if "fc2_weight" in sd:
-                    sd["fc2_weight"].copy_(
-                        block.mlp.c_proj.weight.t().to(torch.bfloat16))
+                    sd["fc2_weight"].copy_(block.mlp.c_proj.weight.t().to(torch.bfloat16))
                 if "fc2_bias" in sd:
-                    sd["fc2_bias"].copy_(
-                        block.mlp.c_proj.bias.to(torch.bfloat16))
+                    sd["fc2_bias"].copy_(block.mlp.c_proj.bias.to(torch.bfloat16))
             else:
                 pwp.ln.weight.copy_(block.ln_2.weight)
                 pwp.ln.bias.copy_(block.ln_2.bias)
-            # Fix for the first FC layer
-            pwp.fc1.weight.copy_(block.mlp.c_fc.weight.t())
-            pwp.fc1.bias.copy_(block.mlp.c_fc.bias)
-            # Fix for the projection layer (also needs transposing!)
-            pwp.fc2.weight.copy_(block.mlp.c_proj.weight.t())
-        block.mlp = pwp
+                # INDENTED: These now only run if TE is disabled
+                pwp.fc1.weight.copy_(block.mlp.c_fc.weight.t())
+                pwp.fc1.bias.copy_(block.mlp.c_fc.bias)
+                pwp.fc2.weight.copy_(block.mlp.c_proj.weight.t())
 
     print(f"  Patched. k={K}, D={N_DOMAINS}, mode=Grassmannian")
     return model
