@@ -202,13 +202,13 @@ def patch_gpt2(model):
                         block.ln_2.bias.to(torch.bfloat16))
                 if "fc1_weight" in sd:
                     sd["fc1_weight"].copy_(
-                        block.mlp.c_fc.weight.to(torch.bfloat16))
+                        block.mlp.c_fc.weight.t().to(torch.bfloat16))
                 if "fc1_bias" in sd:
                     sd["fc1_bias"].copy_(
                         block.mlp.c_fc.bias.to(torch.bfloat16))
                 if "fc2_weight" in sd:
                     sd["fc2_weight"].copy_(
-                        block.mlp.c_proj.weight.to(torch.bfloat16))
+                        block.mlp.c_proj.weight.t().to(torch.bfloat16))
                 if "fc2_bias" in sd:
                     sd["fc2_bias"].copy_(
                         block.mlp.c_proj.bias.to(torch.bfloat16))
