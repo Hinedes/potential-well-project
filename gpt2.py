@@ -102,6 +102,8 @@ class PWPMLPBlock(nn.Module):
                 activation="gelu",
                 params_dtype=torch.bfloat16,
             )
+            # TE hides parameters after the first forward pass, so we cache standard params references here.
+            self._te_trainable_params = [p for n, p in self.mlp.named_parameters() if "layer_norm" not in n]
         else:
             self.ln   = nn.LayerNorm(hidden)
             self.fc1  = nn.Linear(hidden, ffn_dim)
@@ -280,8 +282,7 @@ def train_domain1(model, tokenizer, text):
     for block in model.transformer.h:
         if isinstance(block.mlp, PWPMLPBlock):
             if HAS_TE:
-                params += [p for n, p in block.mlp.mlp.named_parameters()
-                           if "layer_norm" not in n]   # don't train LN for domain 1
+                params += block.mlp._te_trainable_params
             else:
                 params += [p for n, p in block.mlp.named_parameters()
                            if "layer_norm" not in n]   # don't train LN for domain 1
