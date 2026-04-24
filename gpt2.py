@@ -279,9 +279,12 @@ def train_domain1(model, tokenizer, text):
     params = []
     for block in model.transformer.h:
         if isinstance(block.mlp, PWPMLPBlock):
-            src = block.mlp.mlp if HAS_TE else block.mlp
-            params += [p for n, p in src.named_parameters()
-                       if "layer_norm" not in n]   # don't train LN for domain 1
+            if HAS_TE:
+                params += [p for n, p in block.mlp.mlp.named_parameters()
+                           if "layer_norm" not in n]   # don't train LN for domain 1
+            else:
+                params += [p for n, p in block.mlp.named_parameters()
+                           if "layer_norm" not in n]   # don't train LN for domain 1
 
     opt    = torch.optim.AdamW(params, lr=LR)
     scaler = torch.amp.GradScaler()
