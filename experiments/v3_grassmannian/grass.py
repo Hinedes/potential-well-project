@@ -151,8 +151,10 @@ class GrassmannianLayer(nn.Module):
         Pi = P @ P.T  # H x H projection matrix
 
         def grad_hook(grad):
-            # G_tilde = Pi @ G @ Pi  (project both input and output subspace)
-            return Pi @ grad @ Pi
+            projected = Pi @ grad          # project output subspace (rows): always valid
+            if grad.shape[1] == Pi.shape[0]:
+               projected = projected @ Pi  # project input subspace (cols): only if square
+            return projected
 
         self._hook_handle = self.linear.weight.register_hook(grad_hook)
 
