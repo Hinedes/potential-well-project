@@ -1,86 +1,63 @@
 """
-PWP on GPT-2 Small -- First Real Model Test
-============================================
-Replaces GPT-2's MLP linear layers with PWP-partitioned te.Linear layers.
-Uses Transformer Engine (te) instead of nn for linear layers.
+PWP on GPT-2 Small -- Transformer Engine edition
+=================================================
+Correct TE usage per docs:
+    - te.LayerNormMLP for the fused MLP sublayer (LayerNorm + fc1 + gelu + fc2)
+    - te.fp8_autocast(enabled=True, fp8_recipe=...) wraps forward passes
+    - DelayedScaling recipe
+    - is_first_microbatch passed on first step for weight caching optimization
+    - Both weight dims divisible by 16 required for FP8 (GPT-2 768/3072 qualify)
+    - Same module not called twice inside one fp8_autocast region
 
 Test:
-    Domain 0 = original GPT-2 weights, measured by perplexity on WikiText-2
-    Domain 1 = new fine-tuning domain (WikiText-103 subset, different distribution)
-    Metric:   perplexity on WikiText-2 test set before and after domain 1 training
-    Pass:     perplexity delta < 0.5 (domain 0 sector untouched by construction)
-
-Architecture:
-    GPT-2 small: hidden_size=768, n_layer=12, ffn_dim=3072
-    PWP patches the MLP sublayer in each transformer block:
-        c_fc:   768  -> 3072  (fan-out)
-        c_proj: 3072 -> 768   (fan-in)
-    Attention layers left unmodified for this experiment.
-
-Mode selector (empirically derived from sweep):
-    k = hidden_size // D
-    k >= 64  ->  Grassmannian (subspace projection)
-    k <  64  ->  Physical separation (block diagonal)
-
-At D=2: k=384 -> Grassmannian.
-At D=4: k=192 -> Grassmannian.
-At D=8: k=96  -> Grassmannian.
-
-Transformer Engine notes:
-    te.Linear provides fused GEMM kernels optimized for Blackwell (sm_120).
-    FP8 autocast is optional -- disabled by default here for stability.
-    Gradient hooks attach to te.Linear.weight, same API as nn.Linear.
+    Domain 0 = original GPT-2 weights, perplexity on WikiText-2 test set
+    Domain 1 = WikiText-103 fine-tune (200 steps, different distribution)
+    Pass:     domain 0 perplexity delta < 0.5 after domain 1 training
 """
 
 import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-import math
-import copy
 
 try:
     import transformer_engine.pytorch as te
     from transformer_engine.common.recipe import Format, DelayedScaling
     HAS_TE = True
-    print("Transformer Engine found. Using te.Linear.")
+    print("Transformer Engine available. Using te.LayerNormMLP + fp8_autocast.")
 except ImportError:
     HAS_TE = False
     print("Transformer Engine not found. Falling back to nn.Linear.")
-    te = nn  # shim: te.Linear -> nn.Linear
 
 try:
     from transformers import GPT2LMHeadModel, GPT2Tokenizer
     from datasets import load_dataset
-    HAS_HF = True
 except ImportError:
-    HAS_HF = False
-    print("ERROR: transformers and datasets required.")
-    print("  pip install transformers datasets")
-    exit(1)
+    print("pip install transformers datasets")
+    raise
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-N_DOMAINS   = 2          # domain 0 = original GPT-2, domain 1 = new domain
-HIDDEN      = 768        # GPT-2 small hidden_size
-FFN_DIM     = 3072       # GPT-2 small ffn intermediate dim
-SEQ_LEN     = 512        # context window for perplexity eval
+N_DOMAINS   = 2
+HIDDEN      = 768
+FFN_DIM     = 3072
+SEQ_LEN     = 512
 BATCH_SIZE  = 4
 LR          = 1e-4
-TRAIN_STEPS = 200        # domain 1 fine-tuning steps (short -- just enough to move weights)
-EVAL_TOKENS = 4096       # tokens to evaluate perplexity over
+TRAIN_STEPS = 200
+EVAL_TOKENS = 8192
 SEED        = 42
-USE_FP8     = False      # set True if H100/H200/Blackwell + TE FP8 confirmed working
+USE_FP8     = True
 
-K = HIDDEN // N_DOMAINS  # 384 -- well above 64, Grassmannian mode
+K = HIDDEN // N_DOMAINS  # 384 -> Grassmannian mode
 
-# ── Mode selector ─────────────────────────────────────────────────────────────
-
-def select_mode(k):
-    return "grassmannian" if k >= 64 else "physical"
-
-print(f"\nMode: {select_mode(K)} (k={K}, D={N_DOMAINS}, H={HIDDEN})")
+fp8_recipe = DelayedScaling(
+    margin=0,
+    fp8_format=Format.HYBRID,
+    amax_history_len=16,
+    amax_compute_algo="max",
+) if HAS_TE else None
 
 # ── SVD round-robin init ──────────────────────────────────────────────────────
 
@@ -93,373 +70,306 @@ def svd_roundrobin(n, h, k, seed=SEED):
         bases.append(U[:, idx].clone().float())
     return bases
 
-# ── PWP Linear Layer (te.Linear wrapper) ─────────────────────────────────────
+# ── PWP MLP block ─────────────────────────────────────────────────────────────
 
-class PWPLinear(nn.Module):
+class PWPMLPBlock(nn.Module):
     """
-    Drop-in replacement for a linear layer with PWP domain partitioning.
+    Replaces GPT-2's MLP sublayer.
 
-    Uses te.Linear as the underlying compute primitive when TE is available.
-    Gradient hook gates updates to the active domain's subspace.
-    Domain-local incremental Gram-Schmidt enforces orthogonality at domain init.
+    te.LayerNormMLP is the correct TE primitive: one fused kernel covering
+    LayerNorm + Linear(hidden->ffn) + GELU + Linear(ffn->hidden).
+    Because it includes LayerNorm, block.ln_2 is replaced with nn.Identity()
+    during patching.
 
-    Mode: Grassmannian (k >= 64) or Physical (k < 64) selected automatically.
+    Gradient hooks project weight updates onto the active domain's subspace.
+    Forward activations are projected onto the output subspace.
     """
 
-    def __init__(self, in_features, out_features, n_domains, bias=True,
-                 seed_offset=0, layer_id=0):
+    INCLUDES_LAYERNORM = True
+
+    def __init__(self, hidden=HIDDEN, ffn_dim=FFN_DIM, n_domains=N_DOMAINS):
         super().__init__()
-        self.in_features  = in_features
-        self.out_features = out_features
-        self.n_domains    = n_domains
-        self.k            = out_features // n_domains
-        self.mode         = select_mode(self.k)
-        self.frozen       = set()
-        self._active      = None
-        self._hook        = None
+        self.n_domains = n_domains
+        self.k         = hidden // n_domains
 
-        # Core linear layer -- te.Linear if available, else nn.Linear
         if HAS_TE:
-            self.linear = te.Linear(in_features, out_features, bias=bias)
+            self.mlp = te.LayerNormMLP(
+                hidden_size=hidden,
+                ffn_hidden_size=ffn_dim,
+                eps=1e-5,
+                bias=True,
+                normalization="LayerNorm",
+                activation="gelu",
+                params_dtype=torch.bfloat16,
+            )
         else:
-            self.linear = nn.Linear(in_features, out_features, bias=bias)
+            self.ln   = nn.LayerNorm(hidden)
+            self.fc1  = nn.Linear(hidden, ffn_dim)
+            self.fc2  = nn.Linear(ffn_dim, hidden)
+            self.gelu = nn.GELU()
 
-        if self.mode == "grassmannian":
-            # Grassmannian: orthonormal basis per domain
-            bases = svd_roundrobin(n_domains, out_features, self.k,
-                                   seed=SEED + seed_offset + layer_id * 7)
-            for d, P in enumerate(bases):
-                self.register_buffer(f"P_{d}", P)
+        bases_in  = svd_roundrobin(n_domains, hidden, self.k, seed=SEED)
+        bases_out = svd_roundrobin(n_domains, hidden, self.k, seed=SEED + 1)
+        for d in range(n_domains):
+            self.register_buffer(f"P_in_{d}",  bases_in[d])
+            self.register_buffer(f"P_out_{d}", bases_out[d])
+
+        self.frozen      = set()
+        self._active     = 0
+        self._hooks      = []
+        self._first_step = True
+
+    def get_P_in(self, d):  return getattr(self, f"P_in_{d}")
+    def get_P_out(self, d): return getattr(self, f"P_out_{d}")
+
+    def set_active(self, d):
+        self._active     = d
+        self._first_step = True
+        for h in self._hooks: h.remove()
+        self._hooks = []
+        self._install_hooks(d)
+
+    def _install_hooks(self, d):
+        Pi_in  = self.get_P_in(d)  @ self.get_P_in(d).T
+        Pi_out = self.get_P_out(d) @ self.get_P_out(d).T
+
+        if HAS_TE:
+            # te.LayerNormMLP parameter names: fc1_weight (ffn x hidden),
+            # fc2_weight (hidden x ffn)
+            for name, param in self.mlp.named_parameters():
+                if "fc1_weight" in name:
+                    def fc1_hook(g, Pi=Pi_in):
+                        return g @ Pi   # project input dimension (cols)
+                    self._hooks.append(param.register_hook(fc1_hook))
+                elif "fc2_weight" in name:
+                    def fc2_hook(g, Pi=Pi_out):
+                        return Pi @ g   # project output dimension (rows)
+                    self._hooks.append(param.register_hook(fc2_hook))
         else:
-            # Physical: row partition, no basis matrices needed
-            self.h_d = self.k  # out_features // n_domains rows per domain
-
-    def get_P(self, d):
-        return getattr(self, f"P_{d}")
+            self._hooks.append(
+                self.fc1.weight.register_hook(lambda g, Pi=Pi_in: g @ Pi))
+            self._hooks.append(
+                self.fc2.weight.register_hook(lambda g, Pi=Pi_out: Pi @ g))
 
     def prepare_domain(self, d):
-        """
-        Incremental Gram-Schmidt: project P_d into null space of frozen domains.
-        Only meaningful in Grassmannian mode.
-        """
-        if self.mode != "grassmannian":
-            return
-        frozen_bases = [self.get_P(f).detach() for f in sorted(self.frozen)]
-        if not frozen_bases:
-            return
-        V = self.get_P(d).clone()
-        for P_f in frozen_bases:
-            V = V - P_f @ (P_f.T @ V)
-        Q, R = torch.linalg.qr(V)
-        diag = R.diag().abs()
-        if (diag < 1e-6).any():
-            print(f"    WARNING layer {d}: subspace near-collapse, "
-                  f"min diag={diag.min():.2e}")
-        self.get_P(d).copy_(Q)
+        for attr in [f"P_in_{d}", f"P_out_{d}"]:
+            tag = "in" if "_in_" in attr else "out"
+            frozen_bases = [
+                getattr(self, f"P_{tag}_{f}").detach()
+                for f in sorted(self.frozen)
+            ]
+            if not frozen_bases:
+                continue
+            V = getattr(self, attr).clone()
+            for P_f in frozen_bases:
+                V = V - P_f @ (P_f.T @ V)
+            Q, _ = torch.linalg.qr(V)
+            getattr(self, attr).copy_(Q)
 
     def freeze_domain(self, d):
         self.frozen.add(d)
 
-    def set_active(self, d):
-        self._active = d
-        if self._hook:
-            self._hook.remove()
+    def forward(self, x):
+        Pi_out = self.get_P_out(self._active) @ self.get_P_out(self._active).T
 
-        if self.mode == "grassmannian":
-            P  = self.get_P(d)
-            Pi = P @ P.T
-
-            def hook(g):
-                # Project gradient onto domain d's subspace
-                projected = Pi @ g
-                if g.shape[1] == Pi.shape[0]:
-                    projected = projected @ Pi
-                return projected
-
+        if HAS_TE:
+            with te.fp8_autocast(enabled=USE_FP8, fp8_recipe=fp8_recipe):
+                out = self.mlp(x, is_first_microbatch=self._first_step)
+            self._first_step = False
         else:
-            # Physical: zero out gradients outside domain d's row block
-            start = d * self.h_d
-            end   = start + self.h_d
+            out = self.fc2(self.gelu(self.fc1(self.ln(x))))
 
-            def hook(g):
-                mask = torch.zeros_like(g)
-                mask[start:end] = g[start:end]
-                return mask
-
-        self._hook = self.linear.weight.register_hook(hook)
-
-    def forward(self, x):
-        h = self.linear(x)   # (batch, seq, out_features) or (batch, out_features)
-
-        if self.mode == "grassmannian" and self._active is not None:
-            P  = self.get_P(self._active)
-            Pi = P @ P.T
-            h  = h @ Pi.T    # project activations onto active domain's subspace
-
-        elif self.mode == "physical" and self._active is not None:
-            # Zero out activations outside domain d's rows
-            mask = torch.zeros_like(h)
-            start = self._active * self.h_d
-            end   = start + self.h_d
-            mask[..., start:end] = h[..., start:end]
-            h = mask
-
-        return h
-
-
-# ── PWP MLP block (replaces GPT-2's MLP sublayer) ────────────────────────────
-
-class PWPMLP(nn.Module):
-    """
-    Replaces GPT-2's MLP sublayer.
-    GPT-2 MLP: c_fc (768->3072) + gelu + c_proj (3072->768)
-    """
-
-    def __init__(self, n_domains=N_DOMAINS, hidden=HIDDEN, ffn_dim=FFN_DIM):
-        super().__init__()
-        self.c_fc   = PWPLinear(hidden, ffn_dim, n_domains, seed_offset=0)
-        self.c_proj = PWPLinear(ffn_dim, hidden, n_domains, seed_offset=50)
-        self.act    = nn.GELU()
-
-    def set_active(self, d):
-        self.c_fc.set_active(d)
-        self.c_proj.set_active(d)
-
-    def prepare_domain(self, d):
-        self.c_fc.prepare_domain(d)
-        self.c_proj.prepare_domain(d)
-
-    def freeze_domain(self, d):
-        self.c_fc.freeze_domain(d)
-        self.c_proj.freeze_domain(d)
-
-    def forward(self, x):
-        return self.c_proj(self.act(self.c_fc(x)))
+        return out @ Pi_out.T   # project onto active domain's output subspace
 
 
 # ── Patch GPT-2 ───────────────────────────────────────────────────────────────
 
-def patch_gpt2(model, n_domains=N_DOMAINS):
-    """
-    Replace each transformer block's MLP sublayer with PWPMLP.
-    Copy original weights into domain 0's partition.
-    """
-    print(f"\nPatching GPT-2 ({len(model.transformer.h)} layers) with PWP MLP...")
-
-    for layer_idx, block in enumerate(model.transformer.h):
-        orig_mlp = block.mlp
-        pwp_mlp  = PWPMLP(n_domains=n_domains).to(DEVICE)
-
-        # Copy original c_fc weights into the PWP linear's underlying weight
+def patch_gpt2(model):
+    print(f"\nPatching GPT-2 ({len(model.transformer.h)} layers)...")
+    for block in model.transformer.h:
+        pwp = PWPMLPBlock().to(DEVICE)
         with torch.no_grad():
-            pwp_mlp.c_fc.linear.weight.copy_(orig_mlp.c_fc.weight)
-            if orig_mlp.c_fc.bias is not None:
-                pwp_mlp.c_fc.linear.bias.copy_(orig_mlp.c_fc.bias)
+            if HAS_TE:
+                sd = {n: p for n, p in pwp.mlp.named_parameters()}
+                if "layer_norm_weight" in sd:
+                    sd["layer_norm_weight"].copy_(
+                        block.ln_2.weight.to(torch.bfloat16))
+                    sd["layer_norm_bias"].copy_(
+                        block.ln_2.bias.to(torch.bfloat16))
+                if "fc1_weight" in sd:
+                    sd["fc1_weight"].copy_(
+                        block.mlp.c_fc.weight.to(torch.bfloat16))
+                if "fc1_bias" in sd:
+                    sd["fc1_bias"].copy_(
+                        block.mlp.c_fc.bias.to(torch.bfloat16))
+                if "fc2_weight" in sd:
+                    sd["fc2_weight"].copy_(
+                        block.mlp.c_proj.weight.to(torch.bfloat16))
+                if "fc2_bias" in sd:
+                    sd["fc2_bias"].copy_(
+                        block.mlp.c_proj.bias.to(torch.bfloat16))
+            else:
+                pwp.ln.weight.copy_(block.ln_2.weight)
+                pwp.ln.bias.copy_(block.ln_2.bias)
+                pwp.fc1.weight.copy_(block.mlp.c_fc.weight)
+                pwp.fc1.bias.copy_(block.mlp.c_fc.bias)
+                pwp.fc2.weight.copy_(block.mlp.c_proj.weight)
+                pwp.fc2.bias.copy_(block.mlp.c_proj.bias)
 
-            pwp_mlp.c_proj.linear.weight.copy_(orig_mlp.c_proj.weight)
-            if orig_mlp.c_proj.bias is not None:
-                pwp_mlp.c_proj.linear.bias.copy_(orig_mlp.c_proj.bias)
+            block.ln_2 = nn.Identity()   # TE handles LN internally
+        block.mlp = pwp
 
-        block.mlp = pwp_mlp
-
-    print(f"  Patched. Mode: {select_mode(K)} (k={K})")
+    print(f"  Patched. k={K}, D={N_DOMAINS}, mode=Grassmannian")
     return model
 
 
 def set_active_domain(model, d):
     for block in model.transformer.h:
-        if isinstance(block.mlp, PWPMLP):
+        if isinstance(block.mlp, PWPMLPBlock):
             block.mlp.set_active(d)
 
 
 def prepare_domain(model, d):
     for block in model.transformer.h:
-        if isinstance(block.mlp, PWPMLP):
+        if isinstance(block.mlp, PWPMLPBlock):
             block.mlp.prepare_domain(d)
 
 
 def freeze_domain(model, d):
     for block in model.transformer.h:
-        if isinstance(block.mlp, PWPMLP):
+        if isinstance(block.mlp, PWPMLPBlock):
             block.mlp.freeze_domain(d)
 
 
-# ── Perplexity Evaluation ─────────────────────────────────────────────────────
+# ── Perplexity ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def compute_perplexity(model, tokenizer, text, domain_id=0, max_tokens=EVAL_TOKENS):
-    """
-    Compute perplexity over a text corpus using sliding window.
-    Sets domain to domain_id before evaluation.
-    """
+def compute_perplexity(model, tokenizer, text, domain_id=0):
     model.eval()
-    set_active_domain(model, domain_id)
+    if domain_id is not None and any(
+            isinstance(b.mlp, PWPMLPBlock) for b in model.transformer.h):
+        set_active_domain(model, domain_id)
 
-    encodings = tokenizer(text, return_tensors="pt", truncation=False)
-    input_ids = encodings.input_ids[0][:max_tokens].to(DEVICE)
+    tokens = tokenizer(text, return_tensors="pt",
+                       truncation=False).input_ids[0][:EVAL_TOKENS].to(DEVICE)
+    nlls, stride = [], SEQ_LEN // 2
 
-    nlls   = []
-    stride = SEQ_LEN // 2
+    for begin in range(0, tokens.size(0) - SEQ_LEN, stride):
+        chunk = tokens[begin:begin + SEQ_LEN].unsqueeze(0)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            nlls.append(model(chunk, labels=chunk.clone()).loss.float())
 
-    for begin in range(0, input_ids.size(0) - SEQ_LEN, stride):
-        end      = begin + SEQ_LEN
-        chunk    = input_ids[begin:end].unsqueeze(0)
-        target   = chunk.clone()
-
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            out  = model(chunk, labels=target)
-        nlls.append(out.loss.float())
-
-    ppl = torch.exp(torch.stack(nlls).mean())
-    return ppl.item()
+    return torch.exp(torch.stack(nlls).mean()).item()
 
 
-# ── Dataset helpers ───────────────────────────────────────────────────────────
-
-def get_text_corpus(dataset_name, split="train", max_chars=500_000):
-    """Load a text corpus from HuggingFace datasets."""
-    if dataset_name == "wikitext-2":
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-        text = "\n".join(ds["text"])
-    elif dataset_name == "wikitext-103":
-        ds = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
-        text = "\n".join(ds["text"])
-    elif dataset_name == "ptb":
-        ds = load_dataset("ptb_text_only", split=split)
-        text = "\n".join(ds["sentence"])
-    else:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-    return text[:max_chars]
-
+# ── Dataset ───────────────────────────────────────────────────────────────────
 
 class TokenDataset(Dataset):
-    def __init__(self, text, tokenizer, seq_len=SEQ_LEN):
-        tokens = tokenizer(text, return_tensors="pt",
-                           truncation=False)["input_ids"][0]
-        # Chunk into non-overlapping windows
-        n = (len(tokens) // seq_len) * seq_len
-        self.chunks = tokens[:n].view(-1, seq_len)
-
-    def __len__(self):   return len(self.chunks)
+    def __init__(self, text, tokenizer):
+        ids = tokenizer(text, return_tensors="pt",
+                        truncation=False).input_ids[0]
+        n = (len(ids) // SEQ_LEN) * SEQ_LEN
+        self.chunks = ids[:n].view(-1, SEQ_LEN)
+    def __len__(self): return len(self.chunks)
     def __getitem__(self, i): return self.chunks[i]
 
 
-# ── Training domain 1 ─────────────────────────────────────────────────────────
+# ── Train domain 1 ────────────────────────────────────────────────────────────
 
-def train_domain1(model, tokenizer, corpus_text, steps=TRAIN_STEPS):
-    """Fine-tune domain 1 on a new corpus. Domain 0 is frozen by construction."""
-    print(f"\nTraining domain 1 ({steps} steps)...")
+def train_domain1(model, tokenizer, text):
+    print(f"\nTraining domain 1 ({TRAIN_STEPS} steps)...")
     prepare_domain(model, 1)
     set_active_domain(model, 1)
 
-    ds     = TokenDataset(corpus_text, tokenizer)
-    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
-
-    # Only optimize domain 1 MLP parameters (the shared linear weights)
-    # In practice: optimizer sees all params but gradient hook zeros cross-domain updates
     params = []
     for block in model.transformer.h:
-        if isinstance(block.mlp, PWPMLP):
-            params += list(block.mlp.c_fc.linear.parameters())
-            params += list(block.mlp.c_proj.linear.parameters())
+        if isinstance(block.mlp, PWPMLPBlock):
+            src = block.mlp.mlp if HAS_TE else block.mlp
+            params += [p for n, p in src.named_parameters()
+                       if "layer_norm" not in n]   # don't train LN for domain 1
 
-    opt     = torch.optim.AdamW(params, lr=LR)
-    scaler  = torch.amp.GradScaler()
-    step    = 0
-    losses  = []
+    opt    = torch.optim.AdamW(params, lr=LR)
+    scaler = torch.amp.GradScaler()
+    loader = DataLoader(TokenDataset(text, tokenizer),
+                        batch_size=BATCH_SIZE, shuffle=True)
 
     model.train()
+    step = 0
     for batch in loader:
-        if step >= steps:
-            break
+        if step >= TRAIN_STEPS: break
         batch = batch.to(DEVICE)
-        labels = batch.clone()
-
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            out  = model(batch, labels=labels)
-            loss = out.loss
-
         opt.zero_grad()
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = model(batch, labels=batch.clone()).loss
         scaler.scale(loss).backward()
         scaler.step(opt)
         scaler.update()
-
-        losses.append(loss.item())
         if step % 50 == 0:
-            print(f"  step {step:>4}/{steps}  loss={loss.item():.4f}")
+            print(f"  step {step:>4}/{TRAIN_STEPS}  loss={loss.item():.4f}")
         step += 1
 
     freeze_domain(model, 1)
-    print(f"  Domain 1 training complete. Mean loss: {np.mean(losses):.4f}")
+    print("  Domain 1 training complete.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     torch.manual_seed(SEED)
-    np.random.seed(SEED)
-
-    print(f"\nDevice: {DEVICE}")
+    print(f"Device: {DEVICE}")
     if DEVICE.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU:    {torch.cuda.get_device_name(0)}")
+        print(f"FP8:    {'enabled' if USE_FP8 and HAS_TE else 'disabled'}")
 
-    # Load GPT-2 small
     print("\nLoading GPT-2 small...")
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
-    model = GPT2LMHeadModel.from_pretrained("gpt2").to(DEVICE)
-    model.eval()
-    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    model = GPT2LMHeadModel.from_pretrained(
+        "gpt2", torch_dtype=torch.bfloat16).to(DEVICE)
 
-    # Load corpora
-    print("\nLoading corpora...")
-    wt2_test  = get_text_corpus("wikitext-2",  split="test")
-    wt103_train = get_text_corpus("wikitext-103", split="train", max_chars=200_000)
-    print(f"  WikiText-2 test:    {len(wt2_test):,} chars")
-    print(f"  WikiText-103 train: {len(wt103_train):,} chars (domain 1)")
+    print("Loading corpora...")
+    wt2_test    = "\n".join(load_dataset("wikitext", "wikitext-2-raw-v1",
+                                         split="test")["text"])[:100_000]
+    wt103_train = "\n".join(load_dataset("wikitext", "wikitext-103-raw-v1",
+                                         split="train")["text"])[:200_000]
 
-    # Baseline perplexity (unpatched GPT-2)
-    print("\nBaseline perplexity (unpatched GPT-2)...")
-    # Temporarily measure before patching
-    baseline_ppl = compute_perplexity(model, tokenizer, wt2_test,
-                                      domain_id=None if not hasattr(model.transformer.h[0].mlp, 'set_active') else 0)
-    print(f"  WikiText-2 PPL (baseline): {baseline_ppl:.3f}")
+    # Baseline (unpatched)
+    print("\nBaseline PPL (unpatched)...")
+    baseline_ppl = compute_perplexity(model, tokenizer, wt2_test, domain_id=None)
+    print(f"  WikiText-2 PPL: {baseline_ppl:.3f}")
 
-    # Patch GPT-2 with PWP MLP
-    model = patch_gpt2(model, n_domains=N_DOMAINS)
-
-    # Initialize domain 0 as active, prepare and freeze it
-    prepare_domain(model, 0)   # no frozen bases yet -- domain 0 gets full space
+    # Patch + freeze domain 0
+    model = patch_gpt2(model)
+    prepare_domain(model, 0)
     set_active_domain(model, 0)
-    freeze_domain(model, 0)    # lock domain 0 permanently
+    freeze_domain(model, 0)
 
-    # Perplexity after patching, domain 0
-    print("\nPerplexity after patching (domain 0, before domain 1 training)...")
+    # Post-patch (domain 0)
+    print("\nPost-patch PPL (domain 0)...")
     post_patch_ppl = compute_perplexity(model, tokenizer, wt2_test, domain_id=0)
-    print(f"  WikiText-2 PPL (domain 0, patched): {post_patch_ppl:.3f}")
+    print(f"  WikiText-2 PPL: {post_patch_ppl:.3f}")
     print(f"  Delta from baseline: {post_patch_ppl - baseline_ppl:+.3f}")
 
     # Train domain 1
     train_domain1(model, tokenizer, wt103_train)
 
-    # Perplexity after domain 1 training -- domain 0 should be unchanged
-    print("\nPerplexity after domain 1 training (domain 0)...")
+    # Final (domain 0 after domain 1 training)
+    print("\nFinal PPL (domain 0, after domain 1)...")
     final_ppl = compute_perplexity(model, tokenizer, wt2_test, domain_id=0)
-    print(f"  WikiText-2 PPL (domain 0, after domain 1): {final_ppl:.3f}")
-    print(f"  Delta from post-patch: {final_ppl - post_patch_ppl:+.3f}")
-    print(f"  Delta from baseline:   {final_ppl - baseline_ppl:+.3f}")
+    print(f"  WikiText-2 PPL: {final_ppl:.3f}")
 
-    print("\n══ RESULT ══════════════════════════════════════════")
-    print(f"  Baseline PPL:          {baseline_ppl:.3f}")
-    print(f"  Post-patch PPL:        {post_patch_ppl:.3f}")
-    print(f"  After domain 1 PPL:    {final_ppl:.3f}")
-    retention_delta = final_ppl - post_patch_ppl
-    status = "PASS" if abs(retention_delta) < 0.5 else "FAIL"
-    print(f"  Retention delta:       {retention_delta:+.3f}  [{status}]")
-    print(f"\n  {'Domain 0 retained.' if status == 'PASS' else 'Domain 0 degraded -- investigate.'}")
+    delta  = final_ppl - post_patch_ppl
+    status = "PASS" if abs(delta) < 0.5 else "FAIL"
 
-    np.save("gpt2_pwp_results.npy", np.array([baseline_ppl, post_patch_ppl, final_ppl]))
-    print("\nSaved: gpt2_pwp_results.npy")
+    print(f"\n══ RESULT ══════════════════════════════════")
+    print(f"  Baseline PPL:       {baseline_ppl:.3f}")
+    print(f"  Post-patch PPL:     {post_patch_ppl:.3f}")
+    print(f"  After domain 1 PPL: {final_ppl:.3f}")
+    print(f"  Retention delta:    {delta:+.3f}  [{status}]")
+
+    np.save("gpt2_pwp_results.npy",
+            np.array([baseline_ppl, post_patch_ppl, final_ppl]))
+    print("Saved: gpt2_pwp_results.npy")
 
 
 if __name__ == "__main__":
