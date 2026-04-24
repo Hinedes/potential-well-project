@@ -170,14 +170,18 @@ class PWPMLPBlock(nn.Module):
         self.frozen.add(d)
 
     def forward(self, x):
+        Pi_in = self.get_P_in(self._active) @ self.get_P_in(self._active).T
         Pi_out = self.get_P_out(self._active) @ self.get_P_out(self._active).T
+
+        # Isolate the input to the active domain's subspace
+        x_proj = x @ Pi_in.T
 
         if HAS_TE:
             with te.fp8_autocast(enabled=USE_FP8, fp8_recipe=fp8_recipe):
-                out = self.mlp(x, is_first_microbatch=self._first_step)
+                out = self.mlp(x_proj, is_first_microbatch=self._first_step)
             self._first_step = False
         else:
-            out = self.fc2(self.gelu(self.fc1(self.ln(x))))
+            out = self.fc2(self.gelu(self.fc1(self.ln(x_proj))))
 
         return out @ Pi_out.T   # project onto active domain's output subspace
 
@@ -211,12 +215,11 @@ def patch_gpt2(model):
             else:
                 pwp.ln.weight.copy_(block.ln_2.weight)
                 pwp.ln.bias.copy_(block.ln_2.bias)
-                pwp.fc1.weight.copy_(block.mlp.c_fc.weight)
-                pwp.fc1.bias.copy_(block.mlp.c_fc.bias)
-                pwp.fc2.weight.copy_(block.mlp.c_proj.weight)
-                pwp.fc2.bias.copy_(block.mlp.c_proj.bias)
-
-            block.ln_2 = nn.Identity()   # TE handles LN internally
+            # Fix for the first FC layer
+            pwp.fc1.weight.copy_(block.mlp.c_fc.weight.t())
+            pwp.fc1.bias.copy_(block.mlp.c_fc.bias)
+            # Fix for the projection layer (also needs transposing!)
+            pwp.fc2.weight.copy_(block.mlp.c_proj.weight.t())
         block.mlp = pwp
 
     print(f"  Patched. k={K}, D={N_DOMAINS}, mode=Grassmannian")
