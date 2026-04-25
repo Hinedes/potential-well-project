@@ -1,18 +1,13 @@
 """
-PWP on GPT-2 Small -- Transformer Engine edition
-=================================================
-Correct TE usage per docs:
-    - te.LayerNormMLP for the fused MLP sublayer (LayerNorm + fc1 + gelu + fc2)
-    - te.fp8_autocast(enabled=True, fp8_recipe=...) wraps forward passes
-    - DelayedScaling recipe
-    - is_first_microbatch passed on first step for weight caching optimization
-    - Both weight dims divisible by 16 required for FP8 (GPT-2 768/3072 qualify)
-    - Same module not called twice inside one fp8_autocast region
+PWP on GPT-2 Small -- The Hypervisor Architecture (Transformer Engine)
+====================================================================
+This script implements the Potential Well Project (PWP) using a Ring -1 
+Hypervisor model. 
 
-Test:
-    Domain 0 = original GPT-2 weights, perplexity on WikiText-2 test set
-    Domain 1 = WikiText-103 fine-tune (200 steps, different distribution)
-    Pass:     domain 0 perplexity delta < 0.5 after domain 1 training
+- Ring 0: The physical GPT-2 weight tensors.
+- Ring 3: The Guest OS (AdamW Optimizer), which believes it is training the whole network.
+- Ring -1: The Grassmannian Projection Hooks, which intercept the optimizer's 
+           memory writes and sandbox them into mutually orthogonal subspaces.
 """
 
 import torch
@@ -59,7 +54,7 @@ fp8_recipe = DelayedScaling(
     amax_compute_algo="max",
 ) if HAS_TE else None
 
-# ── SVD round-robin init ──────────────────────────────────────────────────────
+# ── SVD round-robin init (The Memory Allocator) ───────────────────────────────
 
 def svd_roundrobin(n, h, k, seed=SEED):
     torch.manual_seed(seed)
@@ -70,21 +65,9 @@ def svd_roundrobin(n, h, k, seed=SEED):
         bases.append(U[:, idx].clone().float())
     return bases
 
-# ── PWP MLP block ─────────────────────────────────────────────────────────────
+# ── PWP MLP block (The Virtual Machine) ───────────────────────────────────────
 
 class PWPMLPBlock(nn.Module):
-    """
-    Replaces GPT-2's MLP sublayer.
-
-    te.LayerNormMLP is the correct TE primitive: one fused kernel covering
-    LayerNorm + Linear(hidden->ffn) + GELU + Linear(ffn->hidden).
-    Because it includes LayerNorm, block.ln_2 is replaced with nn.Identity()
-    during patching.
-
-    Gradient hooks project weight updates onto the active domain's subspace.
-    Forward activations are projected onto the output subspace.
-    """
-
     INCLUDES_LAYERNORM = True
 
     def __init__(self, hidden=HIDDEN, ffn_dim=FFN_DIM, n_domains=N_DOMAINS):
@@ -130,6 +113,11 @@ class PWPMLPBlock(nn.Module):
         self._install_hooks(d)
 
     def _install_hooks(self, d):
+        """
+        RING -1: The Hardware Trap
+        This is the Controller. It intercepts the raw memory writes from the 
+        optimizer and translates them using the MMU (Pi_in, Pi_out).
+        """
         Pi_in  = self.get_P_in(d)  @ self.get_P_in(d).T
         Pi_out = self.get_P_out(d) @ self.get_P_out(d).T
 
@@ -141,17 +129,6 @@ class PWPMLPBlock(nn.Module):
                 elif "fc2_weight" in name:
                     def fc2_hook(g, Pi=Pi_out): return Pi @ g
                     self._hooks.append(param.register_hook(fc2_hook))
-            # Just in case named_parameters() is obscured, fallback to robust attribute checking
-            if not self._hooks:
-                for name in ["fc1_weight", "fc2_weight"]:
-                    if hasattr(self.mlp, name):
-                        param = getattr(self.mlp, name)
-                        if "fc1" in name:
-                            def fc1_hook(g, Pi=Pi_in): return g @ Pi
-                            self._hooks.append(param.register_hook(fc1_hook))
-                        elif "fc2" in name:
-                            def fc2_hook(g, Pi=Pi_out): return Pi @ g
-                            self._hooks.append(param.register_hook(fc2_hook))
         else:
             self._hooks.append(
                 self.fc1.weight.register_hook(lambda g, Pi=Pi_in: g @ Pi))
@@ -216,7 +193,6 @@ def patch_gpt2(model):
             else:
                 pwp.ln.weight.copy_(block.ln_2.weight)
                 pwp.ln.bias.copy_(block.ln_2.bias)
-                # INDENTED: These now only run if TE is disabled
                 pwp.fc1.weight.copy_(block.mlp.c_fc.weight.t())
                 pwp.fc1.bias.copy_(block.mlp.c_fc.bias)
                 pwp.fc2.weight.copy_(block.mlp.c_proj.weight.t())
@@ -224,18 +200,15 @@ def patch_gpt2(model):
     print(f"  Patched. k={K}, D={N_DOMAINS}, mode=Grassmannian")
     return model
 
-
 def set_active_domain(model, d):
     for block in model.transformer.h:
         if isinstance(block.mlp, PWPMLPBlock):
             block.mlp.set_active(d)
 
-
 def prepare_domain(model, d):
     for block in model.transformer.h:
         if isinstance(block.mlp, PWPMLPBlock):
             block.mlp.prepare_domain(d)
-
 
 def freeze_domain(model, d):
     for block in model.transformer.h:
@@ -283,19 +256,26 @@ def train_domain1(model, tokenizer, text):
     prepare_domain(model, 1)
     set_active_domain(model, 1)
 
-    params = []
-    for block in model.transformer.h:
-        if isinstance(block.mlp, PWPMLPBlock):
-            if HAS_TE:
-                # TE can hide or rename parameters after forward passes. Access exact weights natively:
-                for attr in ["fc1_weight", "fc1_bias", "fc2_weight", "fc2_bias"]:
-                    if hasattr(block.mlp.mlp, attr):
-                        params.append(getattr(block.mlp.mlp, attr))
-            else:
-                params += [p for n, p in block.mlp.named_parameters()
-                           if "fc" in n]   # collect all fc ones (excludes LN and P buffers)
+    # ---------------------------------------------------------
+    # RING -1: PROVISIONING GUEST OS MEMORY ACCESS
+    # ---------------------------------------------------------
+    params_for_optimizer = []
+    
+    for name, p in model.named_parameters():
+        # Grant Ring 0 access to the core 2D matrices where the 
+        # Grassmannian hypervisor (hooks) is actively listening.
+        # We explicitly use named_parameters() to bypass TE attribute hiding.
+        if "mlp" in name and "weight" in name and "layer_norm" not in name:
+            p.requires_grad = True
+            params_for_optimizer.append(p)
+        else:
+            # Hard-fault any attempt to touch unvirtualized global memory
+            # (Attention, Embeddings, Biases, LayerNorms)
+            p.requires_grad = False
+    # ---------------------------------------------------------
 
-    opt    = torch.optim.AdamW(params, lr=LR)
+    # Boot the Guest OS with the provisioned pointers
+    opt    = torch.optim.AdamW(params_for_optimizer, lr=LR)
     scaler = torch.amp.GradScaler()
     loader = DataLoader(TokenDataset(text, tokenizer),
                         batch_size=BATCH_SIZE, shuffle=True)
@@ -309,8 +289,13 @@ def train_domain1(model, tokenizer, text):
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             loss = model(batch, labels=batch.clone()).loss
         scaler.scale(loss).backward()
+        
+        # Here, the optimizer executes its step. It thinks it is mutating the 
+        # entire 768x3072 matrix, completely unaware the hooks just translated
+        # the gradient into the subspace.
         scaler.step(opt)
         scaler.update()
+        
         if step % 50 == 0:
             print(f"  step {step:>4}/{TRAIN_STEPS}  loss={loss.item():.4f}")
         step += 1
@@ -340,27 +325,22 @@ def main():
     wt103_train = "\n".join(load_dataset("wikitext", "wikitext-103-raw-v1",
                                          split="train")["text"])[:200_000]
 
-    # Baseline (unpatched)
     print("\nBaseline PPL (unpatched)...")
     baseline_ppl = compute_perplexity(model, tokenizer, wt2_test, domain_id=None)
     print(f"  WikiText-2 PPL: {baseline_ppl:.3f}")
 
-    # Patch + freeze domain 0
     model = patch_gpt2(model)
     prepare_domain(model, 0)
     set_active_domain(model, 0)
     freeze_domain(model, 0)
 
-    # Post-patch (domain 0)
     print("\nPost-patch PPL (domain 0)...")
     post_patch_ppl = compute_perplexity(model, tokenizer, wt2_test, domain_id=0)
     print(f"  WikiText-2 PPL: {post_patch_ppl:.3f}")
     print(f"  Delta from baseline: {post_patch_ppl - baseline_ppl:+.3f}")
 
-    # Train domain 1
     train_domain1(model, tokenizer, wt103_train)
 
-    # Final (domain 0 after domain 1 training)
     print("\nFinal PPL (domain 0, after domain 1)...")
     final_ppl = compute_perplexity(model, tokenizer, wt2_test, domain_id=0)
     print(f"  WikiText-2 PPL: {final_ppl:.3f}")
@@ -377,7 +357,6 @@ def main():
     np.save("gpt2_pwp_results.npy",
             np.array([baseline_ppl, post_patch_ppl, final_ppl]))
     print("Saved: gpt2_pwp_results.npy")
-
 
 if __name__ == "__main__":
     main()
