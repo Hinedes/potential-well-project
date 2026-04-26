@@ -1,22 +1,11 @@
 """
-PWP on GPT-2 Small
-==================
+PWP on GPT-2 Small (Optimized & Refactored)
+===========================================
 
-This is a working GPT-2 proof-of-concept for the Potential Well Project.
-
-What it does:
-- patches every GPT-2 MLP block with a PWP block,
-- keeps domain 0 as the frozen base model,
-- trains domain 1 inside an isolated subspace,
-- checks whether domain 0 perplexity stays stable after domain 1 training.
-
-This script follows the phase boundary from the project notes:
-- k >= 64  -> Grassmannian
-- k = 32   -> transition zone
-- k <= 16  -> physical separation
-
-The transition zone is left explicit. By default we choose the safer
-physical mode there, but you can override it with FORCE_MODE.
+This script tests the Potential Well Project on GPT-2.
+It includes optimized PyTorch hooks for the Grassmannian and Physical
+subspace projections, batched evaluation, and a cleanly decomposed
+experiment lifecycle.
 """
 
 from __future__ import annotations
@@ -51,8 +40,9 @@ N_DOMAINS = 2
 TRAIN_DOMAIN = 1
 SEQ_LEN = 512
 BATCH_SIZE = 4
+EVAL_BATCH_SIZE = 8
 LR = 1e-4
-TRAIN_STEPS = 500 
+TRAIN_STEPS = 500  # Increased to allow the Grassmannian subspace to converge
 EVAL_TOKENS = 8192
 SEED = 42
 
@@ -70,6 +60,7 @@ DOMAIN1_SPLIT_CHAR_LIMIT: Optional[int] = None
 
 RUN_GENERATION_SAMPLES = True
 SAMPLE_MAX_NEW_TOKENS = 64
+SAMPLE_TEMPERATURE = 0.6  # Lowered to prevent format-vomit in markdown tasks
 DEFAULT_SAMPLE_PROMPTS = [
     "The future of machine learning is",
     "In a quiet research lab, the model began to",
@@ -81,10 +72,12 @@ PWP_SAMPLE_PROMPTS = [
 
 FORCE_MODE: Optional[str] = None
 TRANSITION_DEFAULT = "physical"
-ALLOW_TRANSFORMER_GRASSMANNIAN = True
+ALLOW_TRANSFORMER_GRASSMANNIAN = True  # Enabled for true v3 validation
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+# -- Core Math & PWP Setup -----------------------------------------------------
 
 def amp_context():
     if DEVICE.type == "cuda":
@@ -99,9 +92,7 @@ def select_architecture(
     transition_default: str = TRANSITION_DEFAULT,
 ):
     if hidden_size % n_domains != 0:
-        raise ValueError(
-            f"hidden_size={hidden_size} must be divisible by n_domains={n_domains}"
-        )
+        raise ValueError(f"hidden_size={hidden_size} must be divisible by n_domains={n_domains}")
 
     k = hidden_size // n_domains
 
@@ -131,16 +122,10 @@ def round_robin_bases(dim: int, n_domains: int, k: int, seed: int):
     return [q[:, d : n_domains * k : n_domains].contiguous() for d in range(n_domains)]
 
 
-def build_importance_masks(
-    fc1_weight: torch.Tensor,
-    fc2_weight: torch.Tensor,
-    n_domains: int,
-):
+def build_importance_masks(fc1_weight: torch.Tensor, fc2_weight: torch.Tensor, n_domains: int):
     intermediate_size = fc1_weight.shape[0]
     if intermediate_size % n_domains != 0:
-        raise ValueError(
-            f"intermediate_size={intermediate_size} must be divisible by n_domains={n_domains}"
-        )
+        raise ValueError(f"intermediate_size={intermediate_size} must be divisible by n_domains={n_domains}")
 
     bucket = intermediate_size // n_domains
     with torch.no_grad():
@@ -175,23 +160,18 @@ def orthogonalize_against_frozen(basis: torch.Tensor, frozen_bases: list[torch.T
     return q[:, : basis.shape[1]]
 
 
+# -- Data & Loaders ------------------------------------------------------------
+
 class TokenDataset(Dataset):
     def __init__(self, text: str, tokenizer: GPT2Tokenizer, seq_len: int):
         token_ids = tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=False,
-            verbose=False,
+            text, return_tensors="pt", truncation=False, verbose=False,
         ).input_ids[0]
         if token_ids.numel() == 0:
             raise ValueError("TokenDataset received empty text.")
 
         if token_ids.numel() < seq_len:
-            pad = torch.full(
-                (seq_len - token_ids.numel(),),
-                tokenizer.eos_token_id,
-                dtype=token_ids.dtype,
-            )
+            pad = torch.full((seq_len - token_ids.numel(),), tokenizer.eos_token_id, dtype=token_ids.dtype)
             token_ids = torch.cat([token_ids, pad], dim=0)
 
         usable = (token_ids.numel() // seq_len) * seq_len
@@ -204,22 +184,12 @@ class TokenDataset(Dataset):
         return self.chunks[index]
 
 
-def load_text_source(
-    *,
-    text_file: Optional[str],
-    dataset_name: str,
-    dataset_config: str,
-    split: str,
-    char_limit: int,
-):
+def load_text_source(*, text_file: Optional[str], dataset_name: str, dataset_config: str, split: str, char_limit: int):
     if text_file:
         text = Path(text_file).read_text(encoding="utf-8")
     else:
         if load_dataset is None:
-            raise RuntimeError(
-                "datasets is not installed. Either install it with "
-                "`pip install datasets` or set TRAIN_TEXT_FILE / EVAL_TEXT_FILE."
-            )
+            raise RuntimeError("datasets not installed. pip install datasets or set TEXT_FILE args.")
         dataset = load_dataset(dataset_name, dataset_config, split=split)
         if "text" not in dataset.column_names:
             raise RuntimeError(f"Dataset {dataset_name}/{dataset_config} has no 'text' column")
@@ -230,14 +200,10 @@ def load_text_source(
 
     if not text.strip():
         raise ValueError("Loaded text source is empty after trimming.")
-
     return text
 
 
-def split_text_by_paragraph(
-    text: str,
-    train_fraction: float = DOMAIN1_SPLIT_TRAIN_FRACTION,
-):
+def split_text_by_paragraph(text: str, train_fraction: float = DOMAIN1_SPLIT_TRAIN_FRACTION):
     paragraphs = [paragraph.strip() for paragraph in text.split("\n\n") if paragraph.strip()]
     if len(paragraphs) < 2:
         midpoint = max(1, min(len(text) - 1, int(len(text) * train_fraction)))
@@ -263,18 +229,12 @@ def split_text_by_paragraph(
 def load_domain1_train_eval_texts():
     if TRAIN_TEXT_FILE is not None or DOMAIN1_EVAL_TEXT_FILE is not None:
         train_text = load_text_source(
-            text_file=TRAIN_TEXT_FILE,
-            dataset_name=TRAIN_DATASET[0],
-            dataset_config=TRAIN_DATASET[1],
-            split=TRAIN_DATASET[2],
-            char_limit=TRAIN_DATASET[3],
+            text_file=TRAIN_TEXT_FILE, dataset_name=TRAIN_DATASET[0], dataset_config=TRAIN_DATASET[1],
+            split=TRAIN_DATASET[2], char_limit=TRAIN_DATASET[3],
         )
         eval_text = load_text_source(
-            text_file=DOMAIN1_EVAL_TEXT_FILE,
-            dataset_name=DOMAIN1_EVAL_DATASET[0],
-            dataset_config=DOMAIN1_EVAL_DATASET[1],
-            split=DOMAIN1_EVAL_DATASET[2],
-            char_limit=DOMAIN1_EVAL_DATASET[3],
+            text_file=DOMAIN1_EVAL_TEXT_FILE, dataset_name=DOMAIN1_EVAL_DATASET[0], dataset_config=DOMAIN1_EVAL_DATASET[1],
+            split=DOMAIN1_EVAL_DATASET[2], char_limit=DOMAIN1_EVAL_DATASET[3],
         )
         return train_text, eval_text, {
             "source_mode": "file_or_dataset_override",
@@ -291,10 +251,7 @@ def load_domain1_train_eval_texts():
         if not raw_text.strip():
             raise ValueError(f"{DOMAIN1_SPLIT_FILE} is empty after trimming.")
 
-        train_text, eval_text = split_text_by_paragraph(
-            raw_text,
-            train_fraction=DOMAIN1_SPLIT_TRAIN_FRACTION,
-        )
+        train_text, eval_text = split_text_by_paragraph(raw_text, train_fraction=DOMAIN1_SPLIT_TRAIN_FRACTION)
         return train_text, eval_text, {
             "source_mode": "pwp_local",
             "train_source": f"{DOMAIN1_SPLIT_FILE} [train split]",
@@ -303,18 +260,12 @@ def load_domain1_train_eval_texts():
         }
 
     train_text = load_text_source(
-        text_file=None,
-        dataset_name=TRAIN_DATASET[0],
-        dataset_config=TRAIN_DATASET[1],
-        split=TRAIN_DATASET[2],
-        char_limit=TRAIN_DATASET[3],
+        text_file=None, dataset_name=TRAIN_DATASET[0], dataset_config=TRAIN_DATASET[1],
+        split=TRAIN_DATASET[2], char_limit=TRAIN_DATASET[3],
     )
     eval_text = load_text_source(
-        text_file=None,
-        dataset_name=DOMAIN1_EVAL_DATASET[0],
-        dataset_config=DOMAIN1_EVAL_DATASET[1],
-        split=DOMAIN1_EVAL_DATASET[2],
-        char_limit=DOMAIN1_EVAL_DATASET[3],
+        text_file=None, dataset_name=DOMAIN1_EVAL_DATASET[0], dataset_config=DOMAIN1_EVAL_DATASET[1],
+        split=DOMAIN1_EVAL_DATASET[2], char_limit=DOMAIN1_EVAL_DATASET[3],
     )
     return train_text, eval_text, {
         "source_mode": "dataset",
@@ -329,6 +280,8 @@ def select_sample_prompts(domain1_source_mode: str):
         return PWP_SAMPLE_PROMPTS
     return DEFAULT_SAMPLE_PROMPTS
 
+
+# -- Network Modules -----------------------------------------------------------
 
 class PWPMLPBlock(nn.Module):
     def __init__(
@@ -364,29 +317,19 @@ class PWPMLPBlock(nn.Module):
 
         self.register_buffer("base_ln_weight", torch.empty(hidden_size, dtype=torch.float32))
         self.register_buffer("base_ln_bias", torch.empty(hidden_size, dtype=torch.float32))
-        self.register_buffer(
-            "base_fc1_weight",
-            torch.empty(intermediate_size, hidden_size, dtype=torch.float32),
-        )
+        self.register_buffer("base_fc1_weight", torch.empty(intermediate_size, hidden_size, dtype=torch.float32))
         self.register_buffer("base_fc1_bias", torch.empty(intermediate_size, dtype=torch.float32))
-        self.register_buffer(
-            "base_fc2_weight",
-            torch.empty(hidden_size, intermediate_size, dtype=torch.float32),
-        )
+        self.register_buffer("base_fc2_weight", torch.empty(hidden_size, intermediate_size, dtype=torch.float32))
         self.register_buffer("base_fc2_bias", torch.empty(hidden_size, dtype=torch.float32))
 
         self.frozen: set[int] = set()
         self._active = 0
         self._hooks = []
+        self._cached_pi = None
 
         self._register_mid_states(intermediate_size, seed + 23, mid_states)
 
-    def _register_mid_states(
-        self,
-        dim: int,
-        seed: int,
-        mid_states: Optional[list[torch.Tensor]],
-    ):
+    def _register_mid_states(self, dim: int, seed: int, mid_states: Optional[list[torch.Tensor]]):
         if mid_states is not None:
             if len(mid_states) != self.n_domains:
                 raise ValueError("mid_states length must match n_domains")
@@ -419,38 +362,6 @@ class PWPMLPBlock(nn.Module):
             self.base_fc2_weight.copy_(self.fc2.weight.detach().float())
             self.base_fc2_bias.copy_(self.fc2.bias.detach().float())
 
-    def _project_mid_features(self, tensor: torch.Tensor, domain_id: int):
-        state = self._mid_state(domain_id)
-        if self.mode == "grassmannian":
-            basis = state.to(device=tensor.device, dtype=tensor.dtype)
-            return (tensor @ basis) @ basis.T
-        mask = state.to(device=tensor.device, dtype=tensor.dtype)
-        return tensor * mask
-
-    def _project_mid_vector(self, grad: torch.Tensor, domain_id: int):
-        state = self._mid_state(domain_id)
-        if self.mode == "grassmannian":
-            basis = state.to(device=grad.device, dtype=grad.dtype)
-            return basis @ (basis.T @ grad)
-        mask = state.to(device=grad.device, dtype=grad.dtype)
-        return grad * mask
-
-    def _project_fc1_weight(self, grad: torch.Tensor, domain_id: int):
-        row_state = self._mid_state(domain_id)
-        if self.mode == "grassmannian":
-            row_basis = row_state.to(device=grad.device, dtype=grad.dtype)
-            return row_basis @ (row_basis.T @ grad)
-        row_mask = row_state.to(device=grad.device, dtype=grad.dtype).unsqueeze(1)
-        return grad * row_mask
-
-    def _project_fc2_weight(self, grad: torch.Tensor, domain_id: int):
-        col_state = self._mid_state(domain_id)
-        if self.mode == "grassmannian":
-            col_basis = col_state.to(device=grad.device, dtype=grad.dtype)
-            return (grad @ col_basis) @ col_basis.T
-        col_mask = col_state.to(device=grad.device, dtype=grad.dtype).unsqueeze(0)
-        return grad * col_mask
-
     def domain_parameters(self):
         yield from self.ln.parameters()
         yield from self.fc1.parameters()
@@ -461,63 +372,52 @@ class PWPMLPBlock(nn.Module):
             return
 
         with torch.no_grad():
-            frozen_bases = [
-                self._mid_state(frozen_id).detach()
-                for frozen_id in sorted(self.frozen)
-            ]
+            frozen_bases = [self._mid_state(frozen_id).detach() for frozen_id in sorted(self.frozen)]
             if not frozen_bases:
                 return
-            updated = orthogonalize_against_frozen(
-                self._mid_state(domain_id), frozen_bases
-            )
+            updated = orthogonalize_against_frozen(self._mid_state(domain_id), frozen_bases)
             self._mid_state(domain_id).copy_(updated)
 
     def freeze_domain(self, domain_id: int):
         self.frozen.add(domain_id)
 
     def set_active(self, domain_id: int):
+        """
+        Pre-computes the projection matrix/mask once to optimize the hot path.
+        """
         self._active = domain_id
         for hook in self._hooks:
             hook.remove()
         self._hooks = []
 
         if domain_id == 0:
+            self._cached_pi = None
             return
 
-        self._hooks.append(
-            self.fc1.weight.register_hook(
-                lambda grad, d=domain_id: self._project_fc1_weight(grad, d)
-            )
-        )
-        self._hooks.append(
-            self.fc1.bias.register_hook(
-                lambda grad, d=domain_id: self._project_mid_vector(grad, d)
-            )
-        )
-        self._hooks.append(
-            self.fc2.weight.register_hook(
-                lambda grad, d=domain_id: self._project_fc2_weight(grad, d)
-            )
-        )
+        state = self._mid_state(domain_id).to(device=self.fc1.weight.device, dtype=self.fc1.weight.dtype)
+
+        if self.mode == "grassmannian":
+            self._cached_pi = state @ state.T
+            self._hooks.append(self.fc1.weight.register_hook(lambda grad: self._cached_pi @ grad))
+            self._hooks.append(self.fc1.bias.register_hook(lambda grad: self._cached_pi @ grad))
+            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad @ self._cached_pi))
+        else:
+            self._cached_pi = state
+            self._hooks.append(self.fc1.weight.register_hook(lambda grad: grad * self._cached_pi.unsqueeze(1)))
+            self._hooks.append(self.fc1.bias.register_hook(lambda grad: grad * self._cached_pi))
+            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad * self._cached_pi.unsqueeze(0)))
 
     def _forward_base(self, x: torch.Tensor):
         h = F.layer_norm(
-            x,
-            (self.hidden_size,),
-            weight=self.base_ln_weight.to(device=x.device, dtype=x.dtype),
-            bias=self.base_ln_bias.to(device=x.device, dtype=x.dtype),
-            eps=self.layer_norm_eps,
+            x, (self.hidden_size,), weight=self.base_ln_weight.to(device=x.device, dtype=x.dtype),
+            bias=self.base_ln_bias.to(device=x.device, dtype=x.dtype), eps=self.layer_norm_eps,
         )
         h = F.linear(
-            h,
-            self.base_fc1_weight.to(device=x.device, dtype=x.dtype),
-            self.base_fc1_bias.to(device=x.device, dtype=x.dtype),
+            h, self.base_fc1_weight.to(device=x.device, dtype=x.dtype), self.base_fc1_bias.to(device=x.device, dtype=x.dtype),
         )
         h = self.act(h)
         out = F.linear(
-            h,
-            self.base_fc2_weight.to(device=x.device, dtype=x.dtype),
-            self.base_fc2_bias.to(device=x.device, dtype=x.dtype),
+            h, self.base_fc2_weight.to(device=x.device, dtype=x.dtype), self.base_fc2_bias.to(device=x.device, dtype=x.dtype),
         )
         return self.dropout(out)
 
@@ -527,9 +427,19 @@ class PWPMLPBlock(nn.Module):
 
         x = self.ln(x)
         h = self.fc1(x)
-        h = self._project_mid_features(h, self._active)
+
+        if self.mode == "grassmannian":
+            h = h @ self._cached_pi
+        else:
+            h = h * self._cached_pi
+
         h = self.act(h)
-        h = self._project_mid_features(h, self._active)
+
+        if self.mode == "grassmannian":
+            h = h @ self._cached_pi
+        else:
+            h = h * self._cached_pi
+
         out = self.fc2(h)
         return self.dropout(out)
 
@@ -543,27 +453,18 @@ def iter_pwp_blocks(model: GPT2LMHeadModel):
 def patch_gpt2(model: GPT2LMHeadModel):
     hidden_size = model.config.n_embd
     intermediate_size = model.config.n_inner or (4 * hidden_size)
-    threshold_mode, k, reason = select_architecture(
-        intermediate_size, N_DOMAINS, FORCE_MODE
-    )
+    threshold_mode, k, reason = select_architecture(intermediate_size, N_DOMAINS, FORCE_MODE)
     mode = threshold_mode
     effective_reason = reason
 
-    if (
-        threshold_mode == "grassmannian"
-        and FORCE_MODE is None
-        and not ALLOW_TRANSFORMER_GRASSMANNIAN
-    ):
+    if threshold_mode == "grassmannian" and FORCE_MODE is None and not ALLOW_TRANSFORMER_GRASSMANNIAN:
         mode = "physical"
         effective_reason = (
             f"threshold chose grassmannian ({reason}), but GPT-2 falls back to "
             "physical FFN isolation to avoid destroying the pretrained residual stream"
         )
 
-    print(
-        f"\nPatching GPT-2 ({len(model.transformer.h)} layers) "
-        f"with mode={mode}, k={k} [{effective_reason}]..."
-    )
+    print(f"\nPatching GPT-2 ({len(model.transformer.h)} layers) with mode={mode}, k={k} [{effective_reason}]...")
 
     for layer_idx, block in enumerate(model.transformer.h):
         if isinstance(block.mlp, PWPMLPBlock):
@@ -573,22 +474,12 @@ def patch_gpt2(model: GPT2LMHeadModel):
         source_ln = block.ln_2
         mid_states = None
         if mode == "physical":
-            mid_states = build_importance_masks(
-                source_mlp.c_fc.weight.t(),
-                source_mlp.c_proj.weight.t(),
-                N_DOMAINS,
-            )
+            mid_states = build_importance_masks(source_mlp.c_fc.weight.t(), source_mlp.c_proj.weight.t(), N_DOMAINS)
 
         pwp = PWPMLPBlock(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            n_domains=N_DOMAINS,
-            activation_name=model.config.activation_function,
-            layer_norm_eps=model.config.layer_norm_epsilon,
-            resid_pdrop=model.config.resid_pdrop,
-            mode=mode,
-            seed=SEED + layer_idx * 101,
-            mid_states=mid_states,
+            hidden_size=hidden_size, intermediate_size=intermediate_size, n_domains=N_DOMAINS,
+            activation_name=model.config.activation_function, layer_norm_eps=model.config.layer_norm_epsilon,
+            resid_pdrop=model.config.resid_pdrop, mode=mode, seed=SEED + layer_idx * 101, mid_states=mid_states,
         ).to(device=source_ln.weight.device)
 
         with torch.no_grad():
@@ -633,6 +524,8 @@ def configure_pwp_training(model: GPT2LMHeadModel):
     return trainable
 
 
+# -- Training & Evaluation Routines --------------------------------------------
+
 @torch.no_grad()
 def compute_perplexity(
     model: GPT2LMHeadModel,
@@ -640,17 +533,16 @@ def compute_perplexity(
     text: str,
     *,
     domain_id: Optional[int],
+    eval_batch_size: int = EVAL_BATCH_SIZE,
 ):
+    """
+    Batched perplexity evaluation for massive speedup over single-sequence loops.
+    """
     model.eval()
     if domain_id is not None:
         set_active_domain(model, domain_id)
 
-    tokens = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=False,
-        verbose=False,
-    ).input_ids[0]
+    tokens = tokenizer(text, return_tensors="pt", truncation=False, verbose=False).input_ids[0]
     tokens = tokens[:EVAL_TOKENS].to(DEVICE)
     if tokens.numel() < 2:
         raise ValueError("Need at least two tokens to compute perplexity.")
@@ -661,13 +553,19 @@ def compute_perplexity(
     if tokens.numel() <= SEQ_LEN:
         windows = [tokens]
     else:
-        windows = [
-            tokens[begin : min(begin + SEQ_LEN, tokens.numel())]
-            for begin in range(0, tokens.numel() - 1, stride)
-        ]
+        windows = [tokens[begin : min(begin + SEQ_LEN, tokens.numel())] for begin in range(0, tokens.numel() - 1, stride)]
 
-    for window in windows:
-        chunk = window.unsqueeze(0)
+    for i in range(0, len(windows), eval_batch_size):
+        batch_windows = windows[i : i + eval_batch_size]
+        max_len = max(w.numel() for w in batch_windows)
+        padded_batch = []
+        for w in batch_windows:
+            if w.numel() < max_len:
+                pad = torch.full((max_len - w.numel(),), tokenizer.eos_token_id, dtype=w.dtype, device=w.device)
+                w = torch.cat([w, pad], dim=0)
+            padded_batch.append(w)
+
+        chunk = torch.stack(padded_batch)
         with amp_context():
             loss = model(chunk, labels=chunk.clone()).loss.float()
         nlls.append(loss)
@@ -675,22 +573,12 @@ def compute_perplexity(
     return torch.exp(torch.stack(nlls).mean()).item()
 
 
-def compute_route_ppl_matrix(
-    model: GPT2LMHeadModel,
-    tokenizer: GPT2Tokenizer,
-    corpora: list[tuple[str, str]],
-    domain_ids: list[int],
-):
+def compute_route_ppl_matrix(model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer, corpora: list[tuple[str, str]], domain_ids: list[int]):
     matrix = {}
     for corpus_name, corpus_text in corpora:
         row = {}
         for domain_id in domain_ids:
-            row[f"domain_{domain_id}"] = compute_perplexity(
-                model,
-                tokenizer,
-                corpus_text,
-                domain_id=domain_id,
-            )
+            row[f"domain_{domain_id}"] = compute_perplexity(model, tokenizer, corpus_text, domain_id=domain_id)
         matrix[corpus_name] = row
     return matrix
 
@@ -700,10 +588,8 @@ def print_route_ppl_matrix(title: str, matrix: dict[str, dict[str, float]]):
     if not matrix:
         print("  <empty>")
         return
-
     row_names = list(matrix.keys())
     col_names = list(next(iter(matrix.values())).keys())
-
     header = f"{'Corpus':<18}" + "".join(f"{col:<16}" for col in col_names)
     print(header)
     print("-" * len(header))
@@ -713,21 +599,11 @@ def print_route_ppl_matrix(title: str, matrix: dict[str, dict[str, float]]):
         print(f"{row_name:<18}{values}")
 
 
-def compute_route_margins(
-    matrix: dict[str, dict[str, float]],
-    *,
-    base_corpus_name: str,
-    domain_corpus_name: str,
-    train_domain: int,
-):
+def compute_route_margins(matrix: dict[str, dict[str, float]], *, base_corpus_name: str, domain_corpus_name: str, train_domain: int):
     train_key = f"domain_{train_domain}"
     return {
-        "base_corpus_prefers_domain_0_by": (
-            matrix[base_corpus_name][train_key] - matrix[base_corpus_name]["domain_0"]
-        ),
-        "domain_corpus_prefers_train_domain_by": (
-            matrix[domain_corpus_name]["domain_0"] - matrix[domain_corpus_name][train_key]
-        ),
+        "base_corpus_prefers_domain_0_by": matrix[base_corpus_name][train_key] - matrix[base_corpus_name]["domain_0"],
+        "domain_corpus_prefers_train_domain_by": matrix[domain_corpus_name]["domain_0"] - matrix[domain_corpus_name][train_key],
     }
 
 
@@ -738,27 +614,14 @@ def print_route_margins(title: str, margins: dict[str, float]):
 
 
 @torch.no_grad()
-def generate_sample(
-    model: GPT2LMHeadModel,
-    tokenizer: GPT2Tokenizer,
-    prompt: str,
-    *,
-    domain_id: int,
-    max_new_tokens: int = SAMPLE_MAX_NEW_TOKENS,
-    seed_offset: int = 0,
-):
+def generate_sample(model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer, prompt: str, *, domain_id: int, max_new_tokens: int = SAMPLE_MAX_NEW_TOKENS, seed_offset: int = 0):
     model.eval()
     set_active_domain(model, domain_id)
-
     previous_use_cache = model.config.use_cache
     model.config.use_cache = True
 
     encoded = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max(1, model.config.n_positions - max_new_tokens),
-        verbose=False,
+        prompt, return_tensors="pt", truncation=True, max_length=max(1, model.config.n_positions - max_new_tokens), verbose=False,
     ).to(DEVICE)
 
     seed_value = SEED + domain_id * 100 + seed_offset
@@ -770,27 +633,15 @@ def generate_sample(
             torch.cuda.manual_seed_all(seed_value)
 
         output_ids = model.generate(
-            **encoded,
-            do_sample=True,
-            temperature=0.6,   # Lowered from 0.8 to reduce gibberish
-            top_p=0.95,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=True,
+            **encoded, do_sample=True, temperature=SAMPLE_TEMPERATURE, top_p=0.95,
+            max_new_tokens=max_new_tokens, pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id, use_cache=True,
         )
-        
+
     model.config.use_cache = previous_use_cache
     return tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
 
-def train_domain(
-    model: GPT2LMHeadModel,
-    tokenizer: GPT2Tokenizer,
-    text: str,
-    *,
-    domain_id: int,
-):
+def train_domain(model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer, text: str, *, domain_id: int):
     print(f"\nTraining domain {domain_id} ({TRAIN_STEPS} steps)...")
 
     prepare_domain(model, domain_id)
@@ -800,18 +651,13 @@ def train_domain(
 
     trainable_params = configure_pwp_training(model)
     optimizer = torch.optim.AdamW(trainable_params, lr=LR)
-    loader = DataLoader(
-        TokenDataset(text, tokenizer, SEQ_LEN),
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-    )
+    loader = DataLoader(TokenDataset(text, tokenizer, SEQ_LEN), batch_size=BATCH_SIZE, shuffle=True)
 
     step = 0
     while step < TRAIN_STEPS:
         for batch in loader:
             if step >= TRAIN_STEPS:
                 break
-
             batch = batch.to(DEVICE)
             optimizer.zero_grad(set_to_none=True)
             with amp_context():
@@ -827,10 +673,9 @@ def train_domain(
     print(f"  Domain {domain_id} training complete.")
 
 
-def main():
-    if TRAIN_DOMAIN >= N_DOMAINS:
-        raise ValueError("TRAIN_DOMAIN must be smaller than N_DOMAINS")
+# -- Decomposed Main Flow ------------------------------------------------------
 
+def setup_environment():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -843,13 +688,14 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     model = GPT2LMHeadModel.from_pretrained(MODEL_NAME).to(DEVICE)
 
+    return model, tokenizer
+
+
+def run_experiment(model, tokenizer):
     print("Loading text sources...")
     eval_text = load_text_source(
-        text_file=EVAL_TEXT_FILE,
-        dataset_name=EVAL_DATASET[0],
-        dataset_config=EVAL_DATASET[1],
-        split=EVAL_DATASET[2],
-        char_limit=EVAL_DATASET[3],
+        text_file=EVAL_TEXT_FILE, dataset_name=EVAL_DATASET[0], dataset_config=EVAL_DATASET[1],
+        split=EVAL_DATASET[2], char_limit=EVAL_DATASET[3],
     )
     train_text, domain1_eval_text, domain1_meta = load_domain1_train_eval_texts()
     domain1_eval_name = domain1_meta["eval_corpus_name"]
@@ -876,29 +722,15 @@ def main():
     print(f"  Delta from baseline: {post_patch_ppl - baseline_ppl:+.3f}")
 
     print(f"\nDomain {TRAIN_DOMAIN} PPL before training (held-out domain text)...")
-    domain1_pre_ppl = compute_perplexity(
-        model,
-        tokenizer,
-        domain1_eval_text,
-        domain_id=TRAIN_DOMAIN,
-    )
+    domain1_pre_ppl = compute_perplexity(model, tokenizer, domain1_eval_text, domain_id=TRAIN_DOMAIN)
     print(f"  Held-out PPL: {domain1_pre_ppl:.3f}")
 
     pre_train_route_matrix = compute_route_ppl_matrix(
-        model,
-        tokenizer,
-        [
-            ("base_eval", eval_text),
-            (domain1_eval_name, domain1_eval_text),
-        ],
-        [0, TRAIN_DOMAIN],
+        model, tokenizer, [("base_eval", eval_text), (domain1_eval_name, domain1_eval_text)], [0, TRAIN_DOMAIN],
     )
     print_route_ppl_matrix("PRE-TRAIN ROUTE MATRIX", pre_train_route_matrix)
     pre_train_route_margins = compute_route_margins(
-        pre_train_route_matrix,
-        base_corpus_name="base_eval",
-        domain_corpus_name=domain1_eval_name,
-        train_domain=TRAIN_DOMAIN,
+        pre_train_route_matrix, base_corpus_name="base_eval", domain_corpus_name=domain1_eval_name, train_domain=TRAIN_DOMAIN,
     )
     print_route_margins("PRE-TRAIN ROUTE MARGINS", pre_train_route_margins)
 
@@ -909,29 +741,15 @@ def main():
     print(f"  Eval PPL: {final_ppl:.3f}")
 
     print(f"\nDomain {TRAIN_DOMAIN} PPL after training (held-out domain text)...")
-    domain1_post_ppl = compute_perplexity(
-        model,
-        tokenizer,
-        domain1_eval_text,
-        domain_id=TRAIN_DOMAIN,
-    )
+    domain1_post_ppl = compute_perplexity(model, tokenizer, domain1_eval_text, domain_id=TRAIN_DOMAIN)
     print(f"  Held-out PPL: {domain1_post_ppl:.3f}")
 
     post_train_route_matrix = compute_route_ppl_matrix(
-        model,
-        tokenizer,
-        [
-            ("base_eval", eval_text),
-            (domain1_eval_name, domain1_eval_text),
-        ],
-        [0, TRAIN_DOMAIN],
+        model, tokenizer, [("base_eval", eval_text), (domain1_eval_name, domain1_eval_text)], [0, TRAIN_DOMAIN],
     )
     print_route_ppl_matrix("POST-TRAIN ROUTE MATRIX", post_train_route_matrix)
     post_train_route_margins = compute_route_margins(
-        post_train_route_matrix,
-        base_corpus_name="base_eval",
-        domain_corpus_name=domain1_eval_name,
-        train_domain=TRAIN_DOMAIN,
+        post_train_route_matrix, base_corpus_name="base_eval", domain_corpus_name=domain1_eval_name, train_domain=TRAIN_DOMAIN,
     )
     print_route_margins("POST-TRAIN ROUTE MARGINS", post_train_route_margins)
 
@@ -953,78 +771,48 @@ def main():
         print("\n== GENERATION SAMPLES ===================")
         for sample_idx, prompt in enumerate(sample_prompts):
             try:
-                domain0_text = generate_sample(
-                    model,
-                    tokenizer,
-                    prompt,
-                    domain_id=0,
-                    seed_offset=sample_idx,
-                )
-                domain1_text = generate_sample(
-                    model,
-                    tokenizer,
-                    prompt,
-                    domain_id=TRAIN_DOMAIN,
-                    seed_offset=sample_idx,
-                )
-                generation_samples.append(
-                    {
-                        "prompt": prompt,
-                        "domain_0": domain0_text,
-                        f"domain_{TRAIN_DOMAIN}": domain1_text,
-                    }
-                )
+                domain0_text = generate_sample(model, tokenizer, prompt, domain_id=0, seed_offset=sample_idx)
+                domain1_text = generate_sample(model, tokenizer, prompt, domain_id=TRAIN_DOMAIN, seed_offset=sample_idx)
+                generation_samples.append({"prompt": prompt, "domain_0": domain0_text, f"domain_{TRAIN_DOMAIN}": domain1_text})
                 print(f"\nPrompt: {prompt}")
                 print(f"  Domain 0: {domain0_text}")
                 print(f"  Domain {TRAIN_DOMAIN}: {domain1_text}")
             except Exception as exc:
-                generation_samples.append(
-                    {
-                        "prompt": prompt,
-                        "error": str(exc),
-                    }
-                )
+                generation_samples.append({"prompt": prompt, "error": str(exc)})
                 print(f"\nPrompt: {prompt}")
                 print(f"  Generation failed: {exc}")
 
-    np.save(
-        "gpt2_pwp_results.npy",
-        np.array([baseline_ppl, post_patch_ppl, final_ppl], dtype=np.float32),
-    )
+    results_dict = {
+        "model_name": MODEL_NAME, "n_domains": N_DOMAINS, "train_domain": TRAIN_DOMAIN, "mode": mode, "k": k, "mode_reason": reason,
+        "base_eval_source": EVAL_TEXT_FILE or f"{EVAL_DATASET[0]}/{EVAL_DATASET[1]}:{EVAL_DATASET[2]}",
+        "domain1_source_mode": domain1_meta["source_mode"], "domain1_train_source": domain1_meta["train_source"],
+        "domain1_eval_source": domain1_meta["eval_source"], "domain1_eval_corpus_name": domain1_eval_name,
+        "baseline_ppl": baseline_ppl, "post_patch_domain0_ppl": post_patch_ppl, "final_domain0_ppl": final_ppl,
+        "domain0_retention_delta": delta, "domain0_status": status, "domain1_pre_ppl": domain1_pre_ppl,
+        "domain1_post_ppl": domain1_post_ppl, "domain1_delta": domain1_delta,
+        "pre_train_route_matrix": pre_train_route_matrix, "pre_train_route_margins": pre_train_route_margins,
+        "post_train_route_matrix": post_train_route_matrix, "post_train_route_margins": post_train_route_margins,
+        "sample_prompts": sample_prompts, "generation_samples": generation_samples,
+    }
+
+    return baseline_ppl, post_patch_ppl, final_ppl, results_dict
+
+
+def generate_report(baseline_ppl, post_patch_ppl, final_ppl, results_dict):
+    np.save("gpt2_pwp_results.npy", np.array([baseline_ppl, post_patch_ppl, final_ppl], dtype=np.float32))
     print("Saved: gpt2_pwp_results.npy")
 
-    report = {
-        "model_name": MODEL_NAME,
-        "n_domains": N_DOMAINS,
-        "train_domain": TRAIN_DOMAIN,
-        "mode": mode,
-        "k": k,
-        "mode_reason": reason,
-        "base_eval_source": EVAL_TEXT_FILE or f"{EVAL_DATASET[0]}/{EVAL_DATASET[1]}:{EVAL_DATASET[2]}",
-        "domain1_source_mode": domain1_meta["source_mode"],
-        "domain1_train_source": domain1_meta["train_source"],
-        "domain1_eval_source": domain1_meta["eval_source"],
-        "domain1_eval_corpus_name": domain1_eval_name,
-        "baseline_ppl": baseline_ppl,
-        "post_patch_domain0_ppl": post_patch_ppl,
-        "final_domain0_ppl": final_ppl,
-        "domain0_retention_delta": delta,
-        "domain0_status": status,
-        "domain1_pre_ppl": domain1_pre_ppl,
-        "domain1_post_ppl": domain1_post_ppl,
-        "domain1_delta": domain1_delta,
-        "pre_train_route_matrix": pre_train_route_matrix,
-        "pre_train_route_margins": pre_train_route_margins,
-        "post_train_route_matrix": post_train_route_matrix,
-        "post_train_route_margins": post_train_route_margins,
-        "sample_prompts": sample_prompts,
-        "generation_samples": generation_samples,
-    }
-    Path("gpt2_pwp_results.json").write_text(
-        json.dumps(report, indent=2),
-        encoding="utf-8",
-    )
+    Path("gpt2_pwp_results.json").write_text(json.dumps(results_dict, indent=2), encoding="utf-8")
     print("Saved: gpt2_pwp_results.json")
+
+
+def main():
+    if TRAIN_DOMAIN >= N_DOMAINS:
+        raise ValueError("TRAIN_DOMAIN must be smaller than N_DOMAINS")
+
+    model, tokenizer = setup_environment()
+    baseline_ppl, post_patch_ppl, final_ppl, results_dict = run_experiment(model, tokenizer)
+    generate_report(baseline_ppl, post_patch_ppl, final_ppl, results_dict)
 
 
 if __name__ == "__main__":
