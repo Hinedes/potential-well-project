@@ -122,18 +122,31 @@ def round_robin_bases(reference_weight: torch.Tensor, n_domains: int, k: int):
     if n_domains * k > dim:
         raise ValueError(f"Cannot fit {n_domains} domains with k={k} into dim={dim}")
 
-    # Compute SVD of the pretrained weights to extract principal directions
-    # Ensure it's float32 for stable SVD computation
-    U, S, Vh = torch.linalg.svd(reference_weight.float(), full_matrices=False)
-    
-    # U is (dim, min(dim, ...)). We distribute its columns round-robin.
+    # Compute principal directions from the pretrained weights.
+    # SVD with full_matrices=False returns only min(m, n) vectors, which is
+    # insufficient when k * n_domains approaches dim. We complete the basis
+    # with an orthogonal QR complement.
+    ref_cpu = reference_weight.detach().float().to("cpu")
+    u_reduced, _, _ = torch.linalg.svd(ref_cpu, full_matrices=False)
+
+    if u_reduced.shape[1] < dim:
+        missing = dim - u_reduced.shape[1]
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(0)
+        noise = torch.randn(dim, missing, generator=generator, dtype=u_reduced.dtype)
+        noise = noise - u_reduced @ (u_reduced.T @ noise)
+        q_extra, _ = torch.linalg.qr(noise, mode="reduced")
+        full_basis = torch.cat([u_reduced, q_extra[:, :missing]], dim=1)
+    else:
+        full_basis = u_reduced[:, :dim]
+
     bases = []
     for d in range(n_domains):
         # Grab columns: d, d + n_domains, d + 2*n_domains, ...
         indices = [d + j * n_domains for j in range(k)]
-        basis = U[:, indices].contiguous()
+        basis = full_basis[:, indices].contiguous()
         bases.append(basis)
-        
+
     return bases
 
 def build_importance_masks(fc1_weight: torch.Tensor, fc2_weight: torch.Tensor, n_domains: int):
