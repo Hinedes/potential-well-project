@@ -52,7 +52,7 @@ TRAIN_DOMAIN = 1
 SEQ_LEN = 512
 BATCH_SIZE = 4
 LR = 1e-4
-TRAIN_STEPS = 200
+TRAIN_STEPS = 500 
 EVAL_TOKENS = 8192
 SEED = 42
 
@@ -772,14 +772,14 @@ def generate_sample(
         output_ids = model.generate(
             **encoded,
             do_sample=True,
-            temperature=0.8,
+            temperature=0.6,   # Lowered from 0.8 to reduce gibberish
             top_p=0.95,
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             use_cache=True,
         )
-
+        
     model.config.use_cache = previous_use_cache
     return tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
