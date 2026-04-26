@@ -223,9 +223,14 @@ def load_text_source(*, text_file: Optional[str], dataset_name: str, dataset_con
         if load_dataset is None:
             raise RuntimeError("datasets not installed. pip install datasets or set TEXT_FILE args.")
         dataset = load_dataset(dataset_name, dataset_config, split=split)
-        if "text" not in dataset.column_names:
-            raise RuntimeError(f"Dataset {dataset_name}/{dataset_config} has no 'text' column")
-        text = "\n".join(dataset["text"])
+        
+        # Check for standard text columns or code_search_net's code column
+        if "text" in dataset.column_names:
+            text = "\n\n".join(dataset["text"])
+        elif "whole_func_string" in dataset.column_names:
+            text = "\n\n".join(dataset["whole_func_string"])
+        else:
+            raise RuntimeError(f"Dataset {dataset_name}/{dataset_config} lacks 'text' or 'whole_func_string' columns. Available: {dataset.column_names}")
 
     if char_limit:
         text = text[:char_limit]
@@ -233,7 +238,6 @@ def load_text_source(*, text_file: Optional[str], dataset_name: str, dataset_con
     if not text.strip():
         raise ValueError("Loaded text source is empty after trimming.")
     return text
-
 
 def split_text_by_paragraph(text: str, train_fraction: float = DOMAIN1_SPLIT_TRAIN_FRACTION):
     paragraphs = [paragraph.strip() for paragraph in text.split("\n\n") if paragraph.strip()]
