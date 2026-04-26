@@ -22,6 +22,7 @@ physical mode there, but you can override it with FORCE_MODE.
 from __future__ import annotations
 
 from contextlib import nullcontext
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -57,9 +58,18 @@ SEED = 42
 
 EVAL_TEXT_FILE: Optional[str] = None
 TRAIN_TEXT_FILE: Optional[str] = None
+DOMAIN1_EVAL_TEXT_FILE: Optional[str] = None
 
 EVAL_DATASET = ("wikitext", "wikitext-2-raw-v1", "test", 100_000)
 TRAIN_DATASET = ("wikitext", "wikitext-103-raw-v1", "train", 200_000)
+DOMAIN1_EVAL_DATASET = ("wikitext", "wikitext-103-raw-v1", "validation", 100_000)
+
+RUN_GENERATION_SAMPLES = True
+SAMPLE_MAX_NEW_TOKENS = 64
+SAMPLE_PROMPTS = [
+    "The future of machine learning is",
+    "In a quiet research lab, the model began to",
+]
 
 FORCE_MODE: Optional[str] = None
 TRANSITION_DEFAULT = "physical"
@@ -561,6 +571,50 @@ def compute_perplexity(
     return torch.exp(torch.stack(nlls).mean()).item()
 
 
+@torch.no_grad()
+def generate_sample(
+    model: GPT2LMHeadModel,
+    tokenizer: GPT2Tokenizer,
+    prompt: str,
+    *,
+    domain_id: int,
+    max_new_tokens: int = SAMPLE_MAX_NEW_TOKENS,
+    seed_offset: int = 0,
+):
+    model.eval()
+    set_active_domain(model, domain_id)
+
+    previous_use_cache = model.config.use_cache
+    model.config.use_cache = True
+
+    encoded = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max(1, model.config.n_positions - max_new_tokens),
+        verbose=False,
+    ).to(DEVICE)
+
+    generator_device = DEVICE.type if DEVICE.type == "cuda" else "cpu"
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(SEED + domain_id * 100 + seed_offset)
+
+    output_ids = model.generate(
+        **encoded,
+        do_sample=True,
+        temperature=0.8,
+        top_p=0.95,
+        max_new_tokens=max_new_tokens,
+        pad_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        use_cache=True,
+        generator=generator,
+    )
+
+    model.config.use_cache = previous_use_cache
+    return tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+
 def train_domain(
     model: GPT2LMHeadModel,
     tokenizer: GPT2Tokenizer,
@@ -635,6 +689,13 @@ def main():
         split=TRAIN_DATASET[2],
         char_limit=TRAIN_DATASET[3],
     )
+    domain1_eval_text = load_text_source(
+        text_file=DOMAIN1_EVAL_TEXT_FILE,
+        dataset_name=DOMAIN1_EVAL_DATASET[0],
+        dataset_config=DOMAIN1_EVAL_DATASET[1],
+        split=DOMAIN1_EVAL_DATASET[2],
+        char_limit=DOMAIN1_EVAL_DATASET[3],
+    )
 
     print("\nBaseline PPL (unpatched)...")
     baseline_ppl = compute_perplexity(model, tokenizer, eval_text, domain_id=None)
@@ -652,13 +713,32 @@ def main():
     print(f"  Eval PPL: {post_patch_ppl:.3f}")
     print(f"  Delta from baseline: {post_patch_ppl - baseline_ppl:+.3f}")
 
+    print(f"\nDomain {TRAIN_DOMAIN} PPL before training (held-out domain text)...")
+    domain1_pre_ppl = compute_perplexity(
+        model,
+        tokenizer,
+        domain1_eval_text,
+        domain_id=TRAIN_DOMAIN,
+    )
+    print(f"  Held-out PPL: {domain1_pre_ppl:.3f}")
+
     train_domain(model, tokenizer, train_text, domain_id=TRAIN_DOMAIN)
 
     print("\nFinal PPL (domain 0, after domain 1)...")
     final_ppl = compute_perplexity(model, tokenizer, eval_text, domain_id=0)
     print(f"  Eval PPL: {final_ppl:.3f}")
 
+    print(f"\nDomain {TRAIN_DOMAIN} PPL after training (held-out domain text)...")
+    domain1_post_ppl = compute_perplexity(
+        model,
+        tokenizer,
+        domain1_eval_text,
+        domain_id=TRAIN_DOMAIN,
+    )
+    print(f"  Held-out PPL: {domain1_post_ppl:.3f}")
+
     delta = final_ppl - post_patch_ppl
+    domain1_delta = domain1_post_ppl - domain1_pre_ppl
     status = "PASS" if abs(delta) < 0.5 else "FAIL"
 
     print("\n== RESULT ===============================")
@@ -666,12 +746,67 @@ def main():
     print(f"  Post-patch PPL:     {post_patch_ppl:.3f}")
     print(f"  After domain 1 PPL: {final_ppl:.3f}")
     print(f"  Retention delta:    {delta:+.3f}  [{status}]")
+    print(f"  Domain {TRAIN_DOMAIN} pre PPL:  {domain1_pre_ppl:.3f}")
+    print(f"  Domain {TRAIN_DOMAIN} post PPL: {domain1_post_ppl:.3f}")
+    print(f"  Domain {TRAIN_DOMAIN} delta:    {domain1_delta:+.3f}")
+
+    generation_samples = []
+    if RUN_GENERATION_SAMPLES:
+        print("\n== GENERATION SAMPLES ===================")
+        for sample_idx, prompt in enumerate(SAMPLE_PROMPTS):
+            domain0_text = generate_sample(
+                model,
+                tokenizer,
+                prompt,
+                domain_id=0,
+                seed_offset=sample_idx,
+            )
+            domain1_text = generate_sample(
+                model,
+                tokenizer,
+                prompt,
+                domain_id=TRAIN_DOMAIN,
+                seed_offset=sample_idx,
+            )
+            generation_samples.append(
+                {
+                    "prompt": prompt,
+                    "domain_0": domain0_text,
+                    f"domain_{TRAIN_DOMAIN}": domain1_text,
+                }
+            )
+            print(f"\nPrompt: {prompt}")
+            print(f"  Domain 0: {domain0_text}")
+            print(f"  Domain {TRAIN_DOMAIN}: {domain1_text}")
 
     np.save(
         "gpt2_pwp_results.npy",
         np.array([baseline_ppl, post_patch_ppl, final_ppl], dtype=np.float32),
     )
     print("Saved: gpt2_pwp_results.npy")
+
+    report = {
+        "model_name": MODEL_NAME,
+        "n_domains": N_DOMAINS,
+        "train_domain": TRAIN_DOMAIN,
+        "mode": mode,
+        "k": k,
+        "mode_reason": reason,
+        "baseline_ppl": baseline_ppl,
+        "post_patch_domain0_ppl": post_patch_ppl,
+        "final_domain0_ppl": final_ppl,
+        "domain0_retention_delta": delta,
+        "domain0_status": status,
+        "domain1_pre_ppl": domain1_pre_ppl,
+        "domain1_post_ppl": domain1_post_ppl,
+        "domain1_delta": domain1_delta,
+        "generation_samples": generation_samples,
+    }
+    Path("gpt2_pwp_results.json").write_text(
+        json.dumps(report, indent=2),
+        encoding="utf-8",
+    )
+    print("Saved: gpt2_pwp_results.json")
 
 
 if __name__ == "__main__":
