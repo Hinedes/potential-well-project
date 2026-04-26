@@ -167,8 +167,18 @@ def main():
 
     print(f"\nPython PPL (Zero-Shot Patched): {evaluate(model, eval_tokens):.3f}")
     print(f"Training OSA Shell on Python ({TRAIN_STEPS} steps)...")
+
+    for param in model.parameters():
+        param.requires_grad = False
+    for mlp in osa_mlps:
+        mlp.gate_proj.weight.requires_grad = True
+        mlp.up_proj.weight.requires_grad = True
+        mlp.down_proj.weight.requires_grad = True
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    print(f"Trainable parameters: {sum(param.numel() for param in trainable_params):,}")
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=LR)
     model.train()
     
     batch_gen = get_batches(train_tokens, BATCH_SIZE, SEQ_LEN)
