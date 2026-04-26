@@ -81,7 +81,7 @@ PWP_SAMPLE_PROMPTS = [
 
 FORCE_MODE: Optional[str] = None
 TRANSITION_DEFAULT = "physical"
-ALLOW_TRANSFORMER_GRASSMANNIAN = False
+ALLOW_TRANSFORMER_GRASSMANNIAN = True
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
