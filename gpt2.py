@@ -435,7 +435,9 @@ class PWPMLPBlock(nn.Module):
 
     def set_active(self, domain_id: int):
         """
-        Pre-computes the projection matrix/mask once to optimize the hot path.
+        Implements Asymmetric Read/Write:
+        Forward pass can read from the Invariant Core (Domain 0) + Current Domain.
+        Backward pass is strictly locked to the Current Domain to prevent forgetting.
         """
         self._active = domain_id
         for hook in self._hooks:
@@ -443,23 +445,40 @@ class PWPMLPBlock(nn.Module):
         self._hooks = []
 
         if domain_id == 0:
-            self._cached_pi = None
+            self._pi_forward = None
+            self._pi_backward = None
             return
 
-        state = self._mid_state(domain_id).to(device=self.fc1.weight.device, dtype=self.fc1.weight.dtype)
+        # 1. The Write Lock (Current Domain's shell)
+        state_current = self._mid_state(domain_id).to(
+            device=self.fc1.weight.device, dtype=self.fc1.weight.dtype,
+        )
+
+        # 2. The Invariant Core (Domain 0's foundational subspace)
+        state_core = self._mid_state(0).to(
+            device=self.fc1.weight.device, dtype=self.fc1.weight.dtype,
+        )
 
         if self.mode == "grassmannian":
-            cached_pi = state @ state.T
-            self._cached_pi = cached_pi
-            self._hooks.append(self.fc1.weight.register_hook(lambda grad: cached_pi @ grad))
-            self._hooks.append(self.fc1.bias.register_hook(lambda grad: cached_pi @ grad))
-            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad @ cached_pi))
+            pi_backward = state_current @ state_current.T
+            self._pi_backward = pi_backward
+            pi_core = state_core @ state_core.T
+
+            # Forward combines both subspaces.
+            self._pi_forward = pi_core + pi_backward
+
+            # Backward strictly uses the isolated shell.
+            self._hooks.append(self.fc1.weight.register_hook(lambda grad: pi_backward @ grad))
+            self._hooks.append(self.fc1.bias.register_hook(lambda grad: pi_backward @ grad))
+            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad @ pi_backward))
         else:
-            cached_pi = state
-            self._cached_pi = cached_pi
-            self._hooks.append(self.fc1.weight.register_hook(lambda grad: grad * cached_pi.unsqueeze(1)))
-            self._hooks.append(self.fc1.bias.register_hook(lambda grad: grad * cached_pi))
-            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad * cached_pi.unsqueeze(0)))
+            pi_backward = state_current
+            self._pi_backward = pi_backward
+            self._pi_forward = state_core + pi_backward
+
+            self._hooks.append(self.fc1.weight.register_hook(lambda grad: grad * pi_backward.unsqueeze(1)))
+            self._hooks.append(self.fc1.bias.register_hook(lambda grad: grad * pi_backward))
+            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad * pi_backward.unsqueeze(0)))
 
     def _forward_base(self, x: torch.Tensor):
         h = F.layer_norm(
@@ -482,17 +501,18 @@ class PWPMLPBlock(nn.Module):
         x = self.ln(x)
         h = self.fc1(x)
 
+        # Look through the one-way glass (Core + Shell).
         if self.mode == "grassmannian":
-            h = h @ self._cached_pi
+            h = h @ self._pi_forward
         else:
-            h = h * self._cached_pi
+            h = h * self._pi_forward
 
         h = self.act(h)
 
         if self.mode == "grassmannian":
-            h = h @ self._cached_pi
+            h = h @ self._pi_forward
         else:
-            h = h * self._cached_pi
+            h = h * self._pi_forward
 
         out = self.fc2(h)
         return self.dropout(out)
