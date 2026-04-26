@@ -12,6 +12,7 @@ TRAIN_STEPS = 2000
 SEQ_LEN = 256
 LORA_EQUIVALENT_RANK = 8  # We will dynamically match OSA k to this LoRA rank
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_ID = "Qwen/Qwen3.5-2B-Base"
 
 def load_text_source(dataset_name: str, split: str):
     print(f"Loading {dataset_name} [{split}]...")
@@ -120,13 +121,18 @@ class BulletproofOSAQwenMLP(nn.Module):
 def main():
     print(f"Device: {DEVICE} | Target Parity: LoRA r={LORA_EQUIVALENT_RANK}")
     
-    tokenizer = AutoTokenizer.from_pretrained("unsloth/Qwen3.5-1.7B", trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-    "unsloth/Qwen3.5-2B", 
-    torch_dtype=torch.float16, 
-    device_map=DEVICE, 
-    trust_remote_code=True
-)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    model_kwargs: dict[str, object] = {"trust_remote_code": True}
+    if DEVICE == "cuda":
+        model_kwargs["torch_dtype"] = torch.float16
+        model_kwargs["device_map"] = "auto"
+    else:
+        model_kwargs["torch_dtype"] = torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
+    if DEVICE != "cuda":
+        model.to(DEVICE)
+
     # 1. Measure Raw Baselinetokenizer
     print("\nLoading Base Eval Source (Wikitext)...")
     base_eval_tokens = tokenizer.encode("\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"]))
