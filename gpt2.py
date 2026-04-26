@@ -62,6 +62,7 @@ TRAIN_DATASET = ("wikitext", "wikitext-103-raw-v1", "train", 200_000)
 
 FORCE_MODE: Optional[str] = None
 TRANSITION_DEFAULT = "physical"
+ALLOW_TRANSFORMER_GRASSMANNIAN = False
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -111,6 +112,35 @@ def round_robin_bases(dim: int, n_domains: int, k: int, seed: int):
     return [q[:, d : n_domains * k : n_domains].contiguous() for d in range(n_domains)]
 
 
+def build_importance_masks(
+    fc1_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    n_domains: int,
+):
+    intermediate_size = fc1_weight.shape[0]
+    if intermediate_size % n_domains != 0:
+        raise ValueError(
+            f"intermediate_size={intermediate_size} must be divisible by n_domains={n_domains}"
+        )
+
+    bucket = intermediate_size // n_domains
+    with torch.no_grad():
+        fc1_score = fc1_weight.float().norm(dim=1)
+        fc2_score = fc2_weight.float().norm(dim=0)
+        scores = fc1_score + fc2_score
+        order = torch.argsort(scores, descending=True)
+
+    masks = []
+    for domain_id in range(n_domains):
+        start = domain_id * bucket
+        stop = start + bucket
+        idx = order[start:stop]
+        mask = torch.zeros(intermediate_size, dtype=torch.float32)
+        mask[idx] = 1.0
+        masks.append(mask)
+    return masks
+
+
 def orthogonalize_against_frozen(basis: torch.Tensor, frozen_bases: list[torch.Tensor]):
     updated = basis.clone()
     for frozen in frozen_bases:
@@ -128,7 +158,12 @@ def orthogonalize_against_frozen(basis: torch.Tensor, frozen_bases: list[torch.T
 
 class TokenDataset(Dataset):
     def __init__(self, text: str, tokenizer: GPT2Tokenizer, seq_len: int):
-        token_ids = tokenizer(text, return_tensors="pt", truncation=False).input_ids[0]
+        token_ids = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=False,
+            verbose=False,
+        ).input_ids[0]
         if token_ids.numel() == 0:
             raise ValueError("TokenDataset received empty text.")
 
@@ -192,19 +227,16 @@ class PWPMLPBlock(nn.Module):
         resid_pdrop: float,
         mode: str,
         seed: int,
+        mid_states: Optional[list[torch.Tensor]] = None,
     ):
         super().__init__()
 
-        if hidden_size % n_domains != 0:
-            raise ValueError("hidden_size must be divisible by n_domains")
         if intermediate_size % n_domains != 0:
             raise ValueError("intermediate_size must be divisible by n_domains")
 
-        self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.n_domains = n_domains
         self.mode = mode
-        self.k_hidden = hidden_size // n_domains
         self.k_mid = intermediate_size // n_domains
 
         self.ln = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
@@ -217,83 +249,89 @@ class PWPMLPBlock(nn.Module):
         self._active = 0
         self._hooks = []
 
-        self._register_domain_state("in", hidden_size, self.k_hidden, seed + 11)
-        self._register_domain_state("mid", intermediate_size, self.k_mid, seed + 23)
-        self._register_domain_state("out", hidden_size, self.k_hidden, seed + 37)
+        self._register_mid_states(intermediate_size, seed + 23, mid_states)
 
-    def _register_domain_state(self, tag: str, dim: int, k: int, seed: int):
+    def _register_mid_states(
+        self,
+        dim: int,
+        seed: int,
+        mid_states: Optional[list[torch.Tensor]],
+    ):
+        if mid_states is not None:
+            if len(mid_states) != self.n_domains:
+                raise ValueError("mid_states length must match n_domains")
+            for domain_id, state in enumerate(mid_states):
+                self.register_buffer(f"mid_state_{domain_id}", state.clone().float())
+            return
+
         if self.mode == "grassmannian":
-            bases = round_robin_bases(dim, self.n_domains, k, seed)
+            bases = round_robin_bases(dim, self.n_domains, self.k_mid, seed)
             for domain_id, basis in enumerate(bases):
-                self.register_buffer(f"{tag}_state_{domain_id}", basis)
+                self.register_buffer(f"mid_state_{domain_id}", basis)
             return
 
         for domain_id in range(self.n_domains):
             mask = torch.zeros(dim, dtype=torch.float32)
-            start = domain_id * k
-            stop = start + k
+            start = domain_id * self.k_mid
+            stop = start + self.k_mid
             mask[start:stop] = 1.0
-            self.register_buffer(f"{tag}_state_{domain_id}", mask)
+            self.register_buffer(f"mid_state_{domain_id}", mask)
 
-    def _state(self, tag: str, domain_id: int):
-        return getattr(self, f"{tag}_state_{domain_id}")
+    def _mid_state(self, domain_id: int):
+        return getattr(self, f"mid_state_{domain_id}")
 
-    def _project_features(self, tensor: torch.Tensor, tag: str, domain_id: int):
-        state = self._state(tag, domain_id)
+    def _project_mid_features(self, tensor: torch.Tensor, domain_id: int):
+        state = self._mid_state(domain_id)
         if self.mode == "grassmannian":
             basis = state.to(device=tensor.device, dtype=tensor.dtype)
             return (tensor @ basis) @ basis.T
         mask = state.to(device=tensor.device, dtype=tensor.dtype)
         return tensor * mask
 
-    def _project_vector(self, grad: torch.Tensor, tag: str, domain_id: int):
-        state = self._state(tag, domain_id)
+    def _project_mid_vector(self, grad: torch.Tensor, domain_id: int):
+        state = self._mid_state(domain_id)
         if self.mode == "grassmannian":
             basis = state.to(device=grad.device, dtype=grad.dtype)
             return basis @ (basis.T @ grad)
         mask = state.to(device=grad.device, dtype=grad.dtype)
         return grad * mask
 
-    def _project_matrix(
-        self,
-        grad: torch.Tensor,
-        row_tag: str,
-        col_tag: str,
-        domain_id: int,
-    ):
-        row_state = self._state(row_tag, domain_id)
-        col_state = self._state(col_tag, domain_id)
-
+    def _project_fc1_weight(self, grad: torch.Tensor, domain_id: int):
+        row_state = self._mid_state(domain_id)
         if self.mode == "grassmannian":
             row_basis = row_state.to(device=grad.device, dtype=grad.dtype)
-            col_basis = col_state.to(device=grad.device, dtype=grad.dtype)
-            return row_basis @ (row_basis.T @ grad @ col_basis) @ col_basis.T
-
+            return row_basis @ (row_basis.T @ grad)
         row_mask = row_state.to(device=grad.device, dtype=grad.dtype).unsqueeze(1)
+        return grad * row_mask
+
+    def _project_fc2_weight(self, grad: torch.Tensor, domain_id: int):
+        col_state = self._mid_state(domain_id)
+        if self.mode == "grassmannian":
+            col_basis = col_state.to(device=grad.device, dtype=grad.dtype)
+            return (grad @ col_basis) @ col_basis.T
         col_mask = col_state.to(device=grad.device, dtype=grad.dtype).unsqueeze(0)
-        return grad * row_mask * col_mask
+        return grad * col_mask
 
     def domain_parameters(self):
-        yield from self.ln.parameters()
-        yield from self.fc1.parameters()
-        yield from self.fc2.parameters()
+        yield self.fc1.weight
+        yield self.fc1.bias
+        yield self.fc2.weight
 
     def prepare_domain(self, domain_id: int):
         if self.mode != "grassmannian":
             return
 
         with torch.no_grad():
-            for tag in ("in", "mid", "out"):
-                frozen_bases = [
-                    self._state(tag, frozen_id).detach()
-                    for frozen_id in sorted(self.frozen)
-                ]
-                if not frozen_bases:
-                    continue
-                updated = orthogonalize_against_frozen(
-                    self._state(tag, domain_id), frozen_bases
-                )
-                self._state(tag, domain_id).copy_(updated)
+            frozen_bases = [
+                self._mid_state(frozen_id).detach()
+                for frozen_id in sorted(self.frozen)
+            ]
+            if not frozen_bases:
+                return
+            updated = orthogonalize_against_frozen(
+                self._mid_state(domain_id), frozen_bases
+            )
+            self._mid_state(domain_id).copy_(updated)
 
     def freeze_domain(self, domain_id: int):
         self.frozen.add(domain_id)
@@ -305,46 +343,29 @@ class PWPMLPBlock(nn.Module):
         self._hooks = []
 
         self._hooks.append(
-            self.ln.weight.register_hook(
-                lambda grad, d=domain_id: self._project_vector(grad, "in", d)
-            )
-        )
-        self._hooks.append(
-            self.ln.bias.register_hook(
-                lambda grad, d=domain_id: self._project_vector(grad, "in", d)
-            )
-        )
-        self._hooks.append(
             self.fc1.weight.register_hook(
-                lambda grad, d=domain_id: self._project_matrix(grad, "mid", "in", d)
+                lambda grad, d=domain_id: self._project_fc1_weight(grad, d)
             )
         )
         self._hooks.append(
             self.fc1.bias.register_hook(
-                lambda grad, d=domain_id: self._project_vector(grad, "mid", d)
+                lambda grad, d=domain_id: self._project_mid_vector(grad, d)
             )
         )
         self._hooks.append(
             self.fc2.weight.register_hook(
-                lambda grad, d=domain_id: self._project_matrix(grad, "out", "mid", d)
-            )
-        )
-        self._hooks.append(
-            self.fc2.bias.register_hook(
-                lambda grad, d=domain_id: self._project_vector(grad, "out", d)
+                lambda grad, d=domain_id: self._project_fc2_weight(grad, d)
             )
         )
 
     def forward(self, x: torch.Tensor):
         x = self.ln(x)
-        x = self._project_features(x, "in", self._active)
-        x = self.fc1(x)
-        x = self._project_features(x, "mid", self._active)
-        x = self.act(x)
-        x = self._project_features(x, "mid", self._active)
-        x = self.fc2(x)
-        x = self._project_features(x, "out", self._active)
-        return self.dropout(x)
+        h = self.fc1(x)
+        h = self._project_mid_features(h, self._active)
+        h = self.act(h)
+        h = self._project_mid_features(h, self._active)
+        out = self.fc2(h)
+        return self.dropout(out)
 
 
 def iter_pwp_blocks(model: GPT2LMHeadModel):
@@ -356,11 +377,26 @@ def iter_pwp_blocks(model: GPT2LMHeadModel):
 def patch_gpt2(model: GPT2LMHeadModel):
     hidden_size = model.config.n_embd
     intermediate_size = model.config.n_inner or (4 * hidden_size)
-    mode, k, reason = select_architecture(hidden_size, N_DOMAINS, FORCE_MODE)
+    threshold_mode, k, reason = select_architecture(
+        intermediate_size, N_DOMAINS, FORCE_MODE
+    )
+    mode = threshold_mode
+    effective_reason = reason
+
+    if (
+        threshold_mode == "grassmannian"
+        and FORCE_MODE is None
+        and not ALLOW_TRANSFORMER_GRASSMANNIAN
+    ):
+        mode = "physical"
+        effective_reason = (
+            f"threshold chose grassmannian ({reason}), but GPT-2 falls back to "
+            "physical FFN isolation to avoid destroying the pretrained residual stream"
+        )
 
     print(
         f"\nPatching GPT-2 ({len(model.transformer.h)} layers) "
-        f"with mode={mode}, k={k} [{reason}]..."
+        f"with mode={mode}, k={k} [{effective_reason}]..."
     )
 
     for layer_idx, block in enumerate(model.transformer.h):
@@ -369,6 +405,13 @@ def patch_gpt2(model: GPT2LMHeadModel):
 
         source_mlp = block.mlp
         source_ln = block.ln_2
+        mid_states = None
+        if mode == "physical":
+            mid_states = build_importance_masks(
+                source_mlp.c_fc.weight.t(),
+                source_mlp.c_proj.weight.t(),
+                N_DOMAINS,
+            )
 
         pwp = PWPMLPBlock(
             hidden_size=hidden_size,
@@ -379,6 +422,7 @@ def patch_gpt2(model: GPT2LMHeadModel):
             resid_pdrop=model.config.resid_pdrop,
             mode=mode,
             seed=SEED + layer_idx * 101,
+            mid_states=mid_states,
         ).to(device=source_ln.weight.device)
 
         with torch.no_grad():
@@ -392,7 +436,7 @@ def patch_gpt2(model: GPT2LMHeadModel):
         block.mlp = pwp
         block.ln_2 = nn.Identity()
 
-    return model, mode, k, reason
+    return model, mode, k, effective_reason
 
 
 def set_active_domain(model: GPT2LMHeadModel, domain_id: int):
@@ -434,7 +478,12 @@ def compute_perplexity(
     if domain_id is not None:
         set_active_domain(model, domain_id)
 
-    tokens = tokenizer(text, return_tensors="pt", truncation=False).input_ids[0]
+    tokens = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=False,
+        verbose=False,
+    ).input_ids[0]
     tokens = tokens[:EVAL_TOKENS].to(DEVICE)
     if tokens.numel() < 2:
         raise ValueError("Need at least two tokens to compute perplexity.")
