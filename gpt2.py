@@ -63,12 +63,20 @@ DOMAIN1_EVAL_TEXT_FILE: Optional[str] = None
 EVAL_DATASET = ("wikitext", "wikitext-2-raw-v1", "test", 100_000)
 TRAIN_DATASET = ("wikitext", "wikitext-103-raw-v1", "train", 200_000)
 DOMAIN1_EVAL_DATASET = ("wikitext", "wikitext-103-raw-v1", "validation", 100_000)
+DOMAIN1_SOURCE_MODE = "pwp_local"
+DOMAIN1_SPLIT_FILE = "PWP.md"
+DOMAIN1_SPLIT_TRAIN_FRACTION = 0.9
+DOMAIN1_SPLIT_CHAR_LIMIT: Optional[int] = None
 
 RUN_GENERATION_SAMPLES = True
 SAMPLE_MAX_NEW_TOKENS = 64
-SAMPLE_PROMPTS = [
+DEFAULT_SAMPLE_PROMPTS = [
     "The future of machine learning is",
     "In a quiet research lab, the model began to",
+]
+PWP_SAMPLE_PROMPTS = [
+    "The core insight of the Potential Well Project is",
+    "In 3D weight space, multiple domains can",
 ]
 
 FORCE_MODE: Optional[str] = None
@@ -224,6 +232,102 @@ def load_text_source(
         raise ValueError("Loaded text source is empty after trimming.")
 
     return text
+
+
+def split_text_by_paragraph(
+    text: str,
+    train_fraction: float = DOMAIN1_SPLIT_TRAIN_FRACTION,
+):
+    paragraphs = [paragraph.strip() for paragraph in text.split("\n\n") if paragraph.strip()]
+    if len(paragraphs) < 2:
+        midpoint = max(1, min(len(text) - 1, int(len(text) * train_fraction)))
+        return text[:midpoint], text[midpoint:]
+
+    total_chars = sum(len(paragraph) + 2 for paragraph in paragraphs)
+    target_chars = max(1, int(total_chars * train_fraction))
+
+    running = 0
+    split_idx = 1
+    for idx, paragraph in enumerate(paragraphs[:-1], start=1):
+        running += len(paragraph) + 2
+        split_idx = idx
+        if running >= target_chars:
+            break
+
+    split_idx = max(1, min(len(paragraphs) - 1, split_idx))
+    train_text = "\n\n".join(paragraphs[:split_idx])
+    eval_text = "\n\n".join(paragraphs[split_idx:])
+    return train_text, eval_text
+
+
+def load_domain1_train_eval_texts():
+    if TRAIN_TEXT_FILE is not None or DOMAIN1_EVAL_TEXT_FILE is not None:
+        train_text = load_text_source(
+            text_file=TRAIN_TEXT_FILE,
+            dataset_name=TRAIN_DATASET[0],
+            dataset_config=TRAIN_DATASET[1],
+            split=TRAIN_DATASET[2],
+            char_limit=TRAIN_DATASET[3],
+        )
+        eval_text = load_text_source(
+            text_file=DOMAIN1_EVAL_TEXT_FILE,
+            dataset_name=DOMAIN1_EVAL_DATASET[0],
+            dataset_config=DOMAIN1_EVAL_DATASET[1],
+            split=DOMAIN1_EVAL_DATASET[2],
+            char_limit=DOMAIN1_EVAL_DATASET[3],
+        )
+        return train_text, eval_text, {
+            "source_mode": "file_or_dataset_override",
+            "train_source": TRAIN_TEXT_FILE or f"{TRAIN_DATASET[0]}/{TRAIN_DATASET[1]}:{TRAIN_DATASET[2]}",
+            "eval_source": DOMAIN1_EVAL_TEXT_FILE or f"{DOMAIN1_EVAL_DATASET[0]}/{DOMAIN1_EVAL_DATASET[1]}:{DOMAIN1_EVAL_DATASET[2]}",
+            "eval_corpus_name": "domain1_eval",
+        }
+
+    if DOMAIN1_SOURCE_MODE == "pwp_local":
+        split_path = Path(DOMAIN1_SPLIT_FILE)
+        raw_text = split_path.read_text(encoding="utf-8")
+        if DOMAIN1_SPLIT_CHAR_LIMIT:
+            raw_text = raw_text[:DOMAIN1_SPLIT_CHAR_LIMIT]
+        if not raw_text.strip():
+            raise ValueError(f"{DOMAIN1_SPLIT_FILE} is empty after trimming.")
+
+        train_text, eval_text = split_text_by_paragraph(
+            raw_text,
+            train_fraction=DOMAIN1_SPLIT_TRAIN_FRACTION,
+        )
+        return train_text, eval_text, {
+            "source_mode": "pwp_local",
+            "train_source": f"{DOMAIN1_SPLIT_FILE} [train split]",
+            "eval_source": f"{DOMAIN1_SPLIT_FILE} [eval split]",
+            "eval_corpus_name": "pwp_eval",
+        }
+
+    train_text = load_text_source(
+        text_file=None,
+        dataset_name=TRAIN_DATASET[0],
+        dataset_config=TRAIN_DATASET[1],
+        split=TRAIN_DATASET[2],
+        char_limit=TRAIN_DATASET[3],
+    )
+    eval_text = load_text_source(
+        text_file=None,
+        dataset_name=DOMAIN1_EVAL_DATASET[0],
+        dataset_config=DOMAIN1_EVAL_DATASET[1],
+        split=DOMAIN1_EVAL_DATASET[2],
+        char_limit=DOMAIN1_EVAL_DATASET[3],
+    )
+    return train_text, eval_text, {
+        "source_mode": "dataset",
+        "train_source": f"{TRAIN_DATASET[0]}/{TRAIN_DATASET[1]}:{TRAIN_DATASET[2]}",
+        "eval_source": f"{DOMAIN1_EVAL_DATASET[0]}/{DOMAIN1_EVAL_DATASET[1]}:{DOMAIN1_EVAL_DATASET[2]}",
+        "eval_corpus_name": "domain1_eval",
+    }
+
+
+def select_sample_prompts(domain1_source_mode: str):
+    if domain1_source_mode == "pwp_local":
+        return PWP_SAMPLE_PROMPTS
+    return DEFAULT_SAMPLE_PROMPTS
 
 
 class PWPMLPBlock(nn.Module):
@@ -609,6 +713,30 @@ def print_route_ppl_matrix(title: str, matrix: dict[str, dict[str, float]]):
         print(f"{row_name:<18}{values}")
 
 
+def compute_route_margins(
+    matrix: dict[str, dict[str, float]],
+    *,
+    base_corpus_name: str,
+    domain_corpus_name: str,
+    train_domain: int,
+):
+    train_key = f"domain_{train_domain}"
+    return {
+        "base_corpus_prefers_domain_0_by": (
+            matrix[base_corpus_name][train_key] - matrix[base_corpus_name]["domain_0"]
+        ),
+        "domain_corpus_prefers_train_domain_by": (
+            matrix[domain_corpus_name]["domain_0"] - matrix[domain_corpus_name][train_key]
+        ),
+    }
+
+
+def print_route_margins(title: str, margins: dict[str, float]):
+    print(f"\n== {title} ====================")
+    for key, value in margins.items():
+        print(f"  {key}: {value:+.3f}")
+
+
 @torch.no_grad()
 def generate_sample(
     model: GPT2LMHeadModel,
@@ -723,20 +851,13 @@ def main():
         split=EVAL_DATASET[2],
         char_limit=EVAL_DATASET[3],
     )
-    train_text = load_text_source(
-        text_file=TRAIN_TEXT_FILE,
-        dataset_name=TRAIN_DATASET[0],
-        dataset_config=TRAIN_DATASET[1],
-        split=TRAIN_DATASET[2],
-        char_limit=TRAIN_DATASET[3],
-    )
-    domain1_eval_text = load_text_source(
-        text_file=DOMAIN1_EVAL_TEXT_FILE,
-        dataset_name=DOMAIN1_EVAL_DATASET[0],
-        dataset_config=DOMAIN1_EVAL_DATASET[1],
-        split=DOMAIN1_EVAL_DATASET[2],
-        char_limit=DOMAIN1_EVAL_DATASET[3],
-    )
+    train_text, domain1_eval_text, domain1_meta = load_domain1_train_eval_texts()
+    domain1_eval_name = domain1_meta["eval_corpus_name"]
+    sample_prompts = select_sample_prompts(domain1_meta["source_mode"])
+
+    print(f"  Base eval source:    {EVAL_TEXT_FILE or f'{EVAL_DATASET[0]}/{EVAL_DATASET[1]}:{EVAL_DATASET[2]}'}")
+    print(f"  Domain {TRAIN_DOMAIN} train:  {domain1_meta['train_source']}")
+    print(f"  Domain {TRAIN_DOMAIN} eval:   {domain1_meta['eval_source']}")
 
     print("\nBaseline PPL (unpatched)...")
     baseline_ppl = compute_perplexity(model, tokenizer, eval_text, domain_id=None)
@@ -768,11 +889,18 @@ def main():
         tokenizer,
         [
             ("base_eval", eval_text),
-            ("domain1_eval", domain1_eval_text),
+            (domain1_eval_name, domain1_eval_text),
         ],
         [0, TRAIN_DOMAIN],
     )
     print_route_ppl_matrix("PRE-TRAIN ROUTE MATRIX", pre_train_route_matrix)
+    pre_train_route_margins = compute_route_margins(
+        pre_train_route_matrix,
+        base_corpus_name="base_eval",
+        domain_corpus_name=domain1_eval_name,
+        train_domain=TRAIN_DOMAIN,
+    )
+    print_route_margins("PRE-TRAIN ROUTE MARGINS", pre_train_route_margins)
 
     train_domain(model, tokenizer, train_text, domain_id=TRAIN_DOMAIN)
 
@@ -794,11 +922,18 @@ def main():
         tokenizer,
         [
             ("base_eval", eval_text),
-            ("domain1_eval", domain1_eval_text),
+            (domain1_eval_name, domain1_eval_text),
         ],
         [0, TRAIN_DOMAIN],
     )
     print_route_ppl_matrix("POST-TRAIN ROUTE MATRIX", post_train_route_matrix)
+    post_train_route_margins = compute_route_margins(
+        post_train_route_matrix,
+        base_corpus_name="base_eval",
+        domain_corpus_name=domain1_eval_name,
+        train_domain=TRAIN_DOMAIN,
+    )
+    print_route_margins("POST-TRAIN ROUTE MARGINS", post_train_route_margins)
 
     delta = final_ppl - post_patch_ppl
     domain1_delta = domain1_post_ppl - domain1_pre_ppl
@@ -816,7 +951,7 @@ def main():
     generation_samples = []
     if RUN_GENERATION_SAMPLES:
         print("\n== GENERATION SAMPLES ===================")
-        for sample_idx, prompt in enumerate(SAMPLE_PROMPTS):
+        for sample_idx, prompt in enumerate(sample_prompts):
             try:
                 domain0_text = generate_sample(
                     model,
@@ -865,6 +1000,11 @@ def main():
         "mode": mode,
         "k": k,
         "mode_reason": reason,
+        "base_eval_source": EVAL_TEXT_FILE or f"{EVAL_DATASET[0]}/{EVAL_DATASET[1]}:{EVAL_DATASET[2]}",
+        "domain1_source_mode": domain1_meta["source_mode"],
+        "domain1_train_source": domain1_meta["train_source"],
+        "domain1_eval_source": domain1_meta["eval_source"],
+        "domain1_eval_corpus_name": domain1_eval_name,
         "baseline_ppl": baseline_ppl,
         "post_patch_domain0_ppl": post_patch_ppl,
         "final_domain0_ppl": final_ppl,
@@ -874,7 +1014,10 @@ def main():
         "domain1_post_ppl": domain1_post_ppl,
         "domain1_delta": domain1_delta,
         "pre_train_route_matrix": pre_train_route_matrix,
+        "pre_train_route_margins": pre_train_route_margins,
         "post_train_route_matrix": post_train_route_matrix,
+        "post_train_route_margins": post_train_route_margins,
+        "sample_prompts": sample_prompts,
         "generation_samples": generation_samples,
     }
     Path("gpt2_pwp_results.json").write_text(
