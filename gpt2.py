@@ -60,8 +60,8 @@ TRAIN_TEXT_FILE: Optional[str] = None
 DOMAIN1_EVAL_TEXT_FILE: Optional[str] = None
 
 EVAL_DATASET = ("wikitext", "wikitext-2-raw-v1", "test", 100_000)
-TRAIN_DATASET = ("wikitext", "wikitext-103-raw-v1", "train", 200_000)
-DOMAIN1_EVAL_DATASET = ("wikitext", "wikitext-103-raw-v1", "validation", 100_000)
+TRAIN_DATASET = ("code_search_net", "python", "train", 200_000)
+DOMAIN1_EVAL_DATASET = ("code_search_net", "python", "validation", 100_000)
 DOMAIN1_SOURCE_MODE = "dataset"
 DOMAIN1_SPLIT_FILE = "PWP.md"
 DOMAIN1_SPLIT_TRAIN_FRACTION = 0.9
@@ -71,8 +71,8 @@ RUN_GENERATION_SAMPLES = True
 SAMPLE_MAX_NEW_TOKENS = 64
 SAMPLE_TEMPERATURE = 0.6  # Lowered to prevent format-vomit in markdown tasks
 DEFAULT_SAMPLE_PROMPTS = [
-    "The future of machine learning is",
-    "In a quiet research lab, the model began to",
+    "def calculate_fibonacci(n):",
+    "class NeuralNetwork(nn.Module):",
 ]
 PWP_SAMPLE_PROMPTS = [
     "The core insight of the Potential Well Project is",
