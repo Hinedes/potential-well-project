@@ -94,6 +94,11 @@ def amp_context():
     return nullcontext()
 
 
+def mark_cudagraph_step_begin():
+    if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+        torch.compiler.cudagraph_mark_step_begin()
+
+
 def select_architecture(
     hidden_size: int,
     n_domains: int,
@@ -600,7 +605,8 @@ def compute_perplexity(
     if tokens.numel() < 2:
         raise ValueError("Need at least two tokens to compute perplexity.")
 
-    nlls = []
+    nll_sum = 0.0
+    nll_count = 0
     stride = max(SEQ_LEN // 2, 1)
 
     if tokens.numel() <= SEQ_LEN:
@@ -619,11 +625,15 @@ def compute_perplexity(
             padded_batch.append(w)
 
         chunk = torch.stack(padded_batch)
+        mark_cudagraph_step_begin()
         with amp_context():
             loss = model(chunk, labels=chunk).loss.float()
-        nlls.append(loss)
+        nll_sum += float(loss.item())
+        nll_count += 1
 
-    return torch.exp(torch.stack(nlls).mean()).item()
+    if nll_count == 0:
+        raise ValueError("No evaluation windows were produced for perplexity computation.")
+    return float(np.exp(nll_sum / nll_count))
 
 
 def compute_route_ppl_matrix(model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer, corpora: list[tuple[str, str]], domain_ids: list[int]):
@@ -685,6 +695,7 @@ def generate_sample(model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer, prompt: st
         if DEVICE.type == "cuda":
             torch.cuda.manual_seed_all(seed_value)
 
+        mark_cudagraph_step_begin()
         output_ids = model.generate(
             **encoded, do_sample=True, temperature=SAMPLE_TEMPERATURE, top_p=0.95,
             max_new_tokens=max_new_tokens, pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id, use_cache=True,
@@ -724,6 +735,7 @@ def train_domain(model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer, text: str, *,
                 break
             batch = batch.to(DEVICE, non_blocking=DEVICE.type == "cuda")
             optimizer.zero_grad(set_to_none=True)
+            mark_cudagraph_step_begin()
             with amp_context():
                 loss = model(batch, labels=batch).loss
             loss.backward()
