@@ -46,6 +46,15 @@ TRAIN_STEPS = 500  # Increased to allow the Grassmannian subspace to converge
 EVAL_TOKENS = 8192
 SEED = 42
 
+# -- Performance knobs ---------------------------------------------------------
+
+NUM_WORKERS = 4
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
+PREFETCH_FACTOR = 4
+COMPILE_MODEL = True
+COMPILE_MODE = "reduce-overhead"
+
 EVAL_TEXT_FILE: Optional[str] = None
 TRAIN_TEXT_FILE: Optional[str] = None
 DOMAIN1_EVAL_TEXT_FILE: Optional[str] = None
@@ -108,19 +117,24 @@ def select_architecture(
     return transition_default, k, f"transition zone (16 < k < 64), defaulting to {transition_default}"
 
 
-def round_robin_bases(dim: int, n_domains: int, k: int, seed: int):
+def round_robin_bases(reference_weight: torch.Tensor, n_domains: int, k: int):
+    dim = reference_weight.shape[0]
     if n_domains * k > dim:
         raise ValueError(f"Cannot fit {n_domains} domains with k={k} into dim={dim}")
 
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-
-    q, _ = torch.linalg.qr(
-        torch.randn(dim, n_domains * k, generator=generator, dtype=torch.float32),
-        mode="reduced",
-    )
-    return [q[:, d : n_domains * k : n_domains].contiguous() for d in range(n_domains)]
-
+    # Compute SVD of the pretrained weights to extract principal directions
+    # Ensure it's float32 for stable SVD computation
+    U, S, Vh = torch.linalg.svd(reference_weight.float(), full_matrices=False)
+    
+    # U is (dim, min(dim, ...)). We distribute its columns round-robin.
+    bases = []
+    for d in range(n_domains):
+        # Grab columns: d, d + n_domains, d + 2*n_domains, ...
+        indices = [d + j * n_domains for j in range(k)]
+        basis = U[:, indices].contiguous()
+        bases.append(basis)
+        
+    return bases
 
 def build_importance_masks(fc1_weight: torch.Tensor, fc2_weight: torch.Tensor, n_domains: int):
     intermediate_size = fc1_weight.shape[0]
@@ -296,6 +310,7 @@ class PWPMLPBlock(nn.Module):
         mode: str,
         seed: int,
         mid_states: Optional[list[torch.Tensor]] = None,
+        ref_weight: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -327,9 +342,15 @@ class PWPMLPBlock(nn.Module):
         self._hooks = []
         self._cached_pi = None
 
-        self._register_mid_states(intermediate_size, seed + 23, mid_states)
+        self._register_mid_states(intermediate_size, seed + 23, mid_states, ref_weight=ref_weight)
 
-    def _register_mid_states(self, dim: int, seed: int, mid_states: Optional[list[torch.Tensor]]):
+    def _register_mid_states(
+        self,
+        dim: int,
+        seed: int,
+        mid_states: Optional[list[torch.Tensor]],
+        ref_weight: Optional[torch.Tensor] = None,
+    ):
         if mid_states is not None:
             if len(mid_states) != self.n_domains:
                 raise ValueError("mid_states length must match n_domains")
@@ -338,7 +359,20 @@ class PWPMLPBlock(nn.Module):
             return
 
         if self.mode == "grassmannian":
-            bases = round_robin_bases(dim, self.n_domains, self.k_mid, seed)
+            # Use the SVD of the provided pretrained weight (or fallback to random if none provided).
+            if ref_weight is not None:
+                bases = round_robin_bases(ref_weight, self.n_domains, self.k_mid)
+            else:
+                # Fallback purely for safety, though patch_gpt2 should pass a reference weight.
+                generator = torch.Generator(device="cpu").manual_seed(seed)
+                q, _ = torch.linalg.qr(
+                    torch.randn(dim, self.n_domains * self.k_mid, generator=generator),
+                    mode="reduced",
+                )
+                bases = [
+                    q[:, d : self.n_domains * self.k_mid : self.n_domains].contiguous()
+                    for d in range(self.n_domains)
+                ]
             for domain_id, basis in enumerate(bases):
                 self.register_buffer(f"mid_state_{domain_id}", basis)
             return
@@ -397,15 +431,17 @@ class PWPMLPBlock(nn.Module):
         state = self._mid_state(domain_id).to(device=self.fc1.weight.device, dtype=self.fc1.weight.dtype)
 
         if self.mode == "grassmannian":
-            self._cached_pi = state @ state.T
-            self._hooks.append(self.fc1.weight.register_hook(lambda grad: self._cached_pi @ grad))
-            self._hooks.append(self.fc1.bias.register_hook(lambda grad: self._cached_pi @ grad))
-            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad @ self._cached_pi))
+            cached_pi = state @ state.T
+            self._cached_pi = cached_pi
+            self._hooks.append(self.fc1.weight.register_hook(lambda grad: cached_pi @ grad))
+            self._hooks.append(self.fc1.bias.register_hook(lambda grad: cached_pi @ grad))
+            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad @ cached_pi))
         else:
-            self._cached_pi = state
-            self._hooks.append(self.fc1.weight.register_hook(lambda grad: grad * self._cached_pi.unsqueeze(1)))
-            self._hooks.append(self.fc1.bias.register_hook(lambda grad: grad * self._cached_pi))
-            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad * self._cached_pi.unsqueeze(0)))
+            cached_pi = state
+            self._cached_pi = cached_pi
+            self._hooks.append(self.fc1.weight.register_hook(lambda grad: grad * cached_pi.unsqueeze(1)))
+            self._hooks.append(self.fc1.bias.register_hook(lambda grad: grad * cached_pi))
+            self._hooks.append(self.fc2.weight.register_hook(lambda grad: grad * cached_pi.unsqueeze(0)))
 
     def _forward_base(self, x: torch.Tensor):
         h = F.layer_norm(
@@ -479,7 +515,11 @@ def patch_gpt2(model: GPT2LMHeadModel):
         pwp = PWPMLPBlock(
             hidden_size=hidden_size, intermediate_size=intermediate_size, n_domains=N_DOMAINS,
             activation_name=model.config.activation_function, layer_norm_eps=model.config.layer_norm_epsilon,
-            resid_pdrop=model.config.resid_pdrop, mode=mode, seed=SEED + layer_idx * 101, mid_states=mid_states,
+            resid_pdrop=model.config.resid_pdrop,
+            mode=mode,
+            seed=SEED + layer_idx * 101,
+            mid_states=mid_states,
+            ref_weight=source_mlp.c_fc.weight.t().float(),
         ).to(device=source_ln.weight.device)
 
         with torch.no_grad():
@@ -567,7 +607,7 @@ def compute_perplexity(
 
         chunk = torch.stack(padded_batch)
         with amp_context():
-            loss = model(chunk, labels=chunk.clone()).loss.float()
+            loss = model(chunk, labels=chunk).loss.float()
         nlls.append(loss)
 
     return torch.exp(torch.stack(nlls).mean()).item()
@@ -651,17 +691,28 @@ def train_domain(model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer, text: str, *,
 
     trainable_params = configure_pwp_training(model)
     optimizer = torch.optim.AdamW(trainable_params, lr=LR)
-    loader = DataLoader(TokenDataset(text, tokenizer, SEQ_LEN), batch_size=BATCH_SIZE, shuffle=True)
+    dataset = TokenDataset(text, tokenizer, SEQ_LEN)
+    use_workers = NUM_WORKERS > 0
+    loader_kwargs = {
+        "batch_size": BATCH_SIZE,
+        "shuffle": True,
+        "num_workers": NUM_WORKERS,
+        "pin_memory": PIN_MEMORY and DEVICE.type == "cuda",
+    }
+    if use_workers:
+        loader_kwargs["persistent_workers"] = PERSISTENT_WORKERS
+        loader_kwargs["prefetch_factor"] = PREFETCH_FACTOR
+    loader = DataLoader(dataset, **loader_kwargs)
 
     step = 0
     while step < TRAIN_STEPS:
         for batch in loader:
             if step >= TRAIN_STEPS:
                 break
-            batch = batch.to(DEVICE)
+            batch = batch.to(DEVICE, non_blocking=DEVICE.type == "cuda")
             optimizer.zero_grad(set_to_none=True)
             with amp_context():
-                loss = model(batch, labels=batch.clone()).loss
+                loss = model(batch, labels=batch).loss
             loss.backward()
             optimizer.step()
 
@@ -678,6 +729,13 @@ def train_domain(model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer, text: str, *,
 def setup_environment():
     torch.manual_seed(SEED)
     np.random.seed(SEED)
+
+    if DEVICE.type == "cuda":
+        # Enable fast Tensor Core math paths on modern NVIDIA GPUs.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     print(f"Device: {DEVICE}")
     if DEVICE.type == "cuda":
@@ -711,6 +769,13 @@ def run_experiment(model, tokenizer):
 
     model, mode, k, reason = patch_gpt2(model)
     print(f"  Selected mode: {mode} (k={k}, {reason})")
+
+    if COMPILE_MODEL and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode=COMPILE_MODE)
+            print(f"  torch.compile enabled (mode={COMPILE_MODE})")
+        except Exception as exc:
+            print(f"  torch.compile unavailable/disabled: {exc}")
 
     prepare_domain(model, 0)
     set_active_domain(model, 0)
