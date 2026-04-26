@@ -39,10 +39,10 @@ MODEL_NAME = "gpt2"
 N_DOMAINS = 2
 TRAIN_DOMAIN = 1
 SEQ_LEN = 512
-BATCH_SIZE = 4
+BATCH_SIZE = 8
 EVAL_BATCH_SIZE = 8
-LR = 1e-4
-TRAIN_STEPS = 500  # Increased to allow the Grassmannian subspace to converge
+LR = 1e-5
+TRAIN_STEPS = 2000  # Increased to allow the Grassmannian subspace to converge
 EVAL_TOKENS = 8192
 SEED = 42
 
