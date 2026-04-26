@@ -23,12 +23,17 @@ def load_text_source(dataset_name: str, split: str):
 
 def get_batches(tokens, batch_size, seq_len):
     step = batch_size * seq_len
-    max_idx = len(tokens) - step - 1 
+    max_idx = len(tokens) - step
     for i in range(0, max_idx, step):
         x_chunk = tokens[i : i + step]
-        y_chunk = tokens[i + 1 : i + 1 + step]
+        # CausalLM shifts labels internally, so labels should match input ids.
+        y_chunk = x_chunk
         yield torch.tensor(x_chunk).view(batch_size, seq_len).to(DEVICE), \
               torch.tensor(y_chunk).view(batch_size, seq_len).to(DEVICE)
+
+def tokenize_corpus(tokenizer, text: str):
+    # Avoid max-length warnings for very long evaluation/training corpora.
+    return tokenizer(text, add_special_tokens=False, truncation=False, verbose=False)["input_ids"]
 
 def evaluate(model, tokens, max_batches=50):
     model.eval()
@@ -124,10 +129,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     model_kwargs: dict[str, object] = {"trust_remote_code": True}
     if DEVICE == "cuda":
-        model_kwargs["torch_dtype"] = torch.float16
+        model_kwargs["dtype"] = torch.float16
         model_kwargs["device_map"] = "auto"
     else:
-        model_kwargs["torch_dtype"] = torch.float32
+        model_kwargs["dtype"] = torch.float32
 
     model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
     if DEVICE != "cuda":
@@ -135,7 +140,8 @@ def main():
 
     # 1. Measure Raw Baselinetokenizer
     print("\nLoading Base Eval Source (Wikitext)...")
-    base_eval_tokens = tokenizer.encode("\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"]))
+    base_eval_text = "\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"])
+    base_eval_tokens = tokenize_corpus(tokenizer, base_eval_text)
     ppl_raw = evaluate(model, base_eval_tokens)
     print(f"Base PPL (Raw Model): {ppl_raw:.3f}")
 
@@ -154,8 +160,8 @@ def main():
     print(f"-> SVD Compression Cost: +{(ppl_patched - ppl_raw):.3f}")
 
     # 3. Code Eval & Training Loop
-    train_tokens = tokenizer.encode(load_text_source("code_search_net", "train"))
-    eval_tokens = tokenizer.encode(load_text_source("code_search_net", "validation"))
+    train_tokens = tokenize_corpus(tokenizer, load_text_source("code_search_net", "train"))
+    eval_tokens = tokenize_corpus(tokenizer, load_text_source("code_search_net", "validation"))
 
     for mlp in osa_mlps: mlp.set_active(domain_id=1)
 
