@@ -24,10 +24,17 @@ def load_text_source(dataset_name: str, split: str):
     return text
 
 def get_batches(tokens, batch_size, seq_len):
-    for i in range(0, len(tokens) - seq_len * batch_size, seq_len * batch_size):
-        chunk = tokens[i : i + seq_len * batch_size]
-        x = torch.tensor(chunk[:-1]).view(batch_size, -1)
-        y = torch.tensor(chunk[1:]).view(batch_size, -1)
+    step = batch_size * seq_len
+    # Ensure we don't go out of bounds when grabbing the y_chunk (+1 offset)
+    max_idx = len(tokens) - step - 1 
+    
+    for i in range(0, max_idx, step):
+        x_chunk = tokens[i : i + step]
+        y_chunk = tokens[i + 1 : i + 1 + step]
+        
+        x = torch.tensor(x_chunk).view(batch_size, seq_len)
+        y = torch.tensor(y_chunk).view(batch_size, seq_len)
+        
         yield x.to(DEVICE), y.to(DEVICE)
 
 def evaluate(model, tokens, max_batches=50):
