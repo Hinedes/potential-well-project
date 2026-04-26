@@ -120,10 +120,14 @@ class BulletproofOSAQwenMLP(nn.Module):
 def main():
     print(f"Device: {DEVICE} | Target Parity: LoRA r={LORA_EQUIVALENT_RANK}")
     
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-1.7B", trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-1.7B", torch_dtype=torch.float16, device_map=DEVICE, trust_remote_code=True)
-    
-    # 1. Measure Raw Baseline
+    tokenizer = AutoTokenizer.from_pretrained("unsloth/Qwen3.5-1.7B", trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+    "unsloth/Qwen3.5-1.7B", 
+    torch_dtype=torch.float16, 
+    device_map=DEVICE, 
+    trust_remote_code=True
+)
+    # 1. Measure Raw Baselinetokenizer
     print("\nLoading Base Eval Source (Wikitext)...")
     base_eval_tokens = tokenizer.encode("\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"]))
     ppl_raw = evaluate(model, base_eval_tokens)
