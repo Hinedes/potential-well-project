@@ -1,2 +1,7 @@
 *.md
 *.pyc
+*.gz
+__pycache__/
+*json
+*.log
+*.npy

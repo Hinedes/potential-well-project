@@ -571,6 +571,44 @@ def compute_perplexity(
     return torch.exp(torch.stack(nlls).mean()).item()
 
 
+def compute_route_ppl_matrix(
+    model: GPT2LMHeadModel,
+    tokenizer: GPT2Tokenizer,
+    corpora: list[tuple[str, str]],
+    domain_ids: list[int],
+):
+    matrix = {}
+    for corpus_name, corpus_text in corpora:
+        row = {}
+        for domain_id in domain_ids:
+            row[f"domain_{domain_id}"] = compute_perplexity(
+                model,
+                tokenizer,
+                corpus_text,
+                domain_id=domain_id,
+            )
+        matrix[corpus_name] = row
+    return matrix
+
+
+def print_route_ppl_matrix(title: str, matrix: dict[str, dict[str, float]]):
+    print(f"\n== {title} ===================")
+    if not matrix:
+        print("  <empty>")
+        return
+
+    row_names = list(matrix.keys())
+    col_names = list(next(iter(matrix.values())).keys())
+
+    header = f"{'Corpus':<18}" + "".join(f"{col:<16}" for col in col_names)
+    print(header)
+    print("-" * len(header))
+    for row_name in row_names:
+        row = matrix[row_name]
+        values = "".join(f"{row[col]:<16.3f}" for col in col_names)
+        print(f"{row_name:<18}{values}")
+
+
 @torch.no_grad()
 def generate_sample(
     model: GPT2LMHeadModel,
@@ -725,6 +763,17 @@ def main():
     )
     print(f"  Held-out PPL: {domain1_pre_ppl:.3f}")
 
+    pre_train_route_matrix = compute_route_ppl_matrix(
+        model,
+        tokenizer,
+        [
+            ("base_eval", eval_text),
+            ("domain1_eval", domain1_eval_text),
+        ],
+        [0, TRAIN_DOMAIN],
+    )
+    print_route_ppl_matrix("PRE-TRAIN ROUTE MATRIX", pre_train_route_matrix)
+
     train_domain(model, tokenizer, train_text, domain_id=TRAIN_DOMAIN)
 
     print("\nFinal PPL (domain 0, after domain 1)...")
@@ -739,6 +788,17 @@ def main():
         domain_id=TRAIN_DOMAIN,
     )
     print(f"  Held-out PPL: {domain1_post_ppl:.3f}")
+
+    post_train_route_matrix = compute_route_ppl_matrix(
+        model,
+        tokenizer,
+        [
+            ("base_eval", eval_text),
+            ("domain1_eval", domain1_eval_text),
+        ],
+        [0, TRAIN_DOMAIN],
+    )
+    print_route_ppl_matrix("POST-TRAIN ROUTE MATRIX", post_train_route_matrix)
 
     delta = final_ppl - post_patch_ppl
     domain1_delta = domain1_post_ppl - domain1_pre_ppl
@@ -813,6 +873,8 @@ def main():
         "domain1_pre_ppl": domain1_pre_ppl,
         "domain1_post_ppl": domain1_post_ppl,
         "domain1_delta": domain1_delta,
+        "pre_train_route_matrix": pre_train_route_matrix,
+        "post_train_route_matrix": post_train_route_matrix,
         "generation_samples": generation_samples,
     }
     Path("gpt2_pwp_results.json").write_text(
