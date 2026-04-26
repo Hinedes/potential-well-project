@@ -10,7 +10,7 @@ BATCH_SIZE = 8
 LR = 1e-5
 TRAIN_STEPS = 2000
 SEQ_LEN = 256
-LORA_EQUIVALENT_RANK = 8  # We will dynamically match OSA k to this LoRA rank
+LORA_EQUIVALENT_RANK = 64  # We will dynamically match OSA k to this LoRA rank
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_ID = "Qwen/Qwen3.5-2B-Base"
 
@@ -72,10 +72,11 @@ class BulletproofOSAQwenMLP(nn.Module):
         """Carves orthogonal subspaces and returns Pi_backward and the Frozen Core."""
         W = layer.weight.data.float()
         out_features, in_features = W.shape
-        k = self._calc_k(in_features, out_features)
+        k = max(1, min(self._calc_k(in_features, out_features), in_features - 1))
         
         # Calculate Input-space Geometry
-        _, _, V = torch.svd(W)
+        _, _, Vh = torch.linalg.svd(W, full_matrices=False)
+        V = Vh.transpose(-2, -1)
         
         # To minimize the Spatial Tax, Domain 0 keeps top singular values. Domain 1 gets the lowest.
         P_0 = V[:, :-k]  # Core Base
