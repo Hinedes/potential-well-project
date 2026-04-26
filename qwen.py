@@ -122,7 +122,7 @@ def main():
     
     tokenizer = AutoTokenizer.from_pretrained("unsloth/Qwen3.5-1.7B", trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-    "unsloth/Qwen3.5-1.7B", 
+    "unsloth/Qwen3.5-2B", 
     torch_dtype=torch.float16, 
     device_map=DEVICE, 
     trust_remote_code=True
