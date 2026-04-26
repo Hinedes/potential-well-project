@@ -28,6 +28,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 try:
@@ -234,16 +235,31 @@ class PWPMLPBlock(nn.Module):
         if intermediate_size % n_domains != 0:
             raise ValueError("intermediate_size must be divisible by n_domains")
 
+        self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.n_domains = n_domains
         self.mode = mode
         self.k_mid = intermediate_size // n_domains
+        self.layer_norm_eps = layer_norm_eps
 
         self.ln = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
         self.fc1 = nn.Linear(hidden_size, intermediate_size)
         self.fc2 = nn.Linear(intermediate_size, hidden_size)
         self.act = ACT2FN[activation_name]
         self.dropout = nn.Dropout(resid_pdrop)
+
+        self.register_buffer("base_ln_weight", torch.empty(hidden_size, dtype=torch.float32))
+        self.register_buffer("base_ln_bias", torch.empty(hidden_size, dtype=torch.float32))
+        self.register_buffer(
+            "base_fc1_weight",
+            torch.empty(intermediate_size, hidden_size, dtype=torch.float32),
+        )
+        self.register_buffer("base_fc1_bias", torch.empty(intermediate_size, dtype=torch.float32))
+        self.register_buffer(
+            "base_fc2_weight",
+            torch.empty(hidden_size, intermediate_size, dtype=torch.float32),
+        )
+        self.register_buffer("base_fc2_bias", torch.empty(hidden_size, dtype=torch.float32))
 
         self.frozen: set[int] = set()
         self._active = 0
@@ -280,6 +296,15 @@ class PWPMLPBlock(nn.Module):
     def _mid_state(self, domain_id: int):
         return getattr(self, f"mid_state_{domain_id}")
 
+    def capture_base_state(self):
+        with torch.no_grad():
+            self.base_ln_weight.copy_(self.ln.weight.detach().float())
+            self.base_ln_bias.copy_(self.ln.bias.detach().float())
+            self.base_fc1_weight.copy_(self.fc1.weight.detach().float())
+            self.base_fc1_bias.copy_(self.fc1.bias.detach().float())
+            self.base_fc2_weight.copy_(self.fc2.weight.detach().float())
+            self.base_fc2_bias.copy_(self.fc2.bias.detach().float())
+
     def _project_mid_features(self, tensor: torch.Tensor, domain_id: int):
         state = self._mid_state(domain_id)
         if self.mode == "grassmannian":
@@ -313,9 +338,9 @@ class PWPMLPBlock(nn.Module):
         return grad * col_mask
 
     def domain_parameters(self):
-        yield self.fc1.weight
-        yield self.fc1.bias
-        yield self.fc2.weight
+        yield from self.ln.parameters()
+        yield from self.fc1.parameters()
+        yield from self.fc2.parameters()
 
     def prepare_domain(self, domain_id: int):
         if self.mode != "grassmannian":
@@ -342,6 +367,9 @@ class PWPMLPBlock(nn.Module):
             hook.remove()
         self._hooks = []
 
+        if domain_id == 0:
+            return
+
         self._hooks.append(
             self.fc1.weight.register_hook(
                 lambda grad, d=domain_id: self._project_fc1_weight(grad, d)
@@ -358,7 +386,31 @@ class PWPMLPBlock(nn.Module):
             )
         )
 
+    def _forward_base(self, x: torch.Tensor):
+        h = F.layer_norm(
+            x,
+            (self.hidden_size,),
+            weight=self.base_ln_weight.to(device=x.device, dtype=x.dtype),
+            bias=self.base_ln_bias.to(device=x.device, dtype=x.dtype),
+            eps=self.layer_norm_eps,
+        )
+        h = F.linear(
+            h,
+            self.base_fc1_weight.to(device=x.device, dtype=x.dtype),
+            self.base_fc1_bias.to(device=x.device, dtype=x.dtype),
+        )
+        h = self.act(h)
+        out = F.linear(
+            h,
+            self.base_fc2_weight.to(device=x.device, dtype=x.dtype),
+            self.base_fc2_bias.to(device=x.device, dtype=x.dtype),
+        )
+        return self.dropout(out)
+
     def forward(self, x: torch.Tensor):
+        if self._active == 0:
+            return self._forward_base(x)
+
         x = self.ln(x)
         h = self.fc1(x)
         h = self._project_mid_features(h, self._active)
@@ -432,6 +484,7 @@ def patch_gpt2(model: GPT2LMHeadModel):
             pwp.fc1.bias.copy_(source_mlp.c_fc.bias.float())
             pwp.fc2.weight.copy_(source_mlp.c_proj.weight.t().float())
             pwp.fc2.bias.copy_(source_mlp.c_proj.bias.float())
+            pwp.capture_base_state()
 
         block.mlp = pwp
         block.ln_2 = nn.Identity()
