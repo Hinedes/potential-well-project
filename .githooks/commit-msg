@@ -1,0 +1,20 @@
+#!/bin/sh
+
+msg_file="$1"
+tmp_file="$msg_file.tmp"
+
+awk '
+BEGIN { IGNORECASE = 1 }
+!/^[[:space:]]*co-authored-by:.*copilot/ { lines[++n] = $0 }
+END {
+  while (n > 0 && lines[n] == "") {
+    n--
+  }
+  for (i = 1; i <= n; i++) {
+    print lines[i]
+  }
+}
+' "$msg_file" > "$tmp_file"
+
+mv "$tmp_file" "$msg_file"
+exit 0
