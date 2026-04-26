@@ -595,21 +595,24 @@ def generate_sample(
         verbose=False,
     ).to(DEVICE)
 
-    generator_device = DEVICE.type if DEVICE.type == "cuda" else "cpu"
-    generator = torch.Generator(device=generator_device)
-    generator.manual_seed(SEED + domain_id * 100 + seed_offset)
+    seed_value = SEED + domain_id * 100 + seed_offset
+    fork_devices = [torch.cuda.current_device()] if DEVICE.type == "cuda" else []
 
-    output_ids = model.generate(
-        **encoded,
-        do_sample=True,
-        temperature=0.8,
-        top_p=0.95,
-        max_new_tokens=max_new_tokens,
-        pad_token_id=tokenizer.eos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        use_cache=True,
-        generator=generator,
-    )
+    with torch.random.fork_rng(devices=fork_devices):
+        torch.manual_seed(seed_value)
+        if DEVICE.type == "cuda":
+            torch.cuda.manual_seed_all(seed_value)
+
+        output_ids = model.generate(
+            **encoded,
+            do_sample=True,
+            temperature=0.8,
+            top_p=0.95,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+        )
 
     model.config.use_cache = previous_use_cache
     return tokenizer.decode(output_ids[0], skip_special_tokens=True)
@@ -754,30 +757,40 @@ def main():
     if RUN_GENERATION_SAMPLES:
         print("\n== GENERATION SAMPLES ===================")
         for sample_idx, prompt in enumerate(SAMPLE_PROMPTS):
-            domain0_text = generate_sample(
-                model,
-                tokenizer,
-                prompt,
-                domain_id=0,
-                seed_offset=sample_idx,
-            )
-            domain1_text = generate_sample(
-                model,
-                tokenizer,
-                prompt,
-                domain_id=TRAIN_DOMAIN,
-                seed_offset=sample_idx,
-            )
-            generation_samples.append(
-                {
-                    "prompt": prompt,
-                    "domain_0": domain0_text,
-                    f"domain_{TRAIN_DOMAIN}": domain1_text,
-                }
-            )
-            print(f"\nPrompt: {prompt}")
-            print(f"  Domain 0: {domain0_text}")
-            print(f"  Domain {TRAIN_DOMAIN}: {domain1_text}")
+            try:
+                domain0_text = generate_sample(
+                    model,
+                    tokenizer,
+                    prompt,
+                    domain_id=0,
+                    seed_offset=sample_idx,
+                )
+                domain1_text = generate_sample(
+                    model,
+                    tokenizer,
+                    prompt,
+                    domain_id=TRAIN_DOMAIN,
+                    seed_offset=sample_idx,
+                )
+                generation_samples.append(
+                    {
+                        "prompt": prompt,
+                        "domain_0": domain0_text,
+                        f"domain_{TRAIN_DOMAIN}": domain1_text,
+                    }
+                )
+                print(f"\nPrompt: {prompt}")
+                print(f"  Domain 0: {domain0_text}")
+                print(f"  Domain {TRAIN_DOMAIN}: {domain1_text}")
+            except Exception as exc:
+                generation_samples.append(
+                    {
+                        "prompt": prompt,
+                        "error": str(exc),
+                    }
+                )
+                print(f"\nPrompt: {prompt}")
+                print(f"  Generation failed: {exc}")
 
     np.save(
         "gpt2_pwp_results.npy",
